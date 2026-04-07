@@ -1,20 +1,3 @@
-<!--
-  Author: Germán Luis Aracil Boned <garacilb@gmail.com>
-
-  This program is free software; you can redistribute it and/or modify
-  it under the terms of the GNU General Public License as published by
-  the Free Software Foundation; either version 2 of the License, or
-  (at your option) any later version.
-
-  This program is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-  GNU General Public License for more details.
-
-  You should have received a copy of the GNU General Public License
-  along with this program; if not, see <https://www.gnu.org/licenses/>.
--->
-
 # Portal v1.0.0
 
 **Universal Modular Core** — A minimal C microkernel that connects hot-loadable modules through path-based message routing. Everything is a path. Every interaction is a message.
@@ -340,6 +323,7 @@ Connect with `portal -n devtest -r` or `portalctl -s /var/run/portal-devtest.soc
 | `verbose off` | Stop message trace |
 | `debug [filter]` | Like verbose + hex/text dump of body |
 | `debug off` | Stop debug trace |
+| `top` | Real-time Portal-internal viewer (modules + threads + msg/min). `q`/`ESC`/`Ctrl-C` to quit. |
 | `locks` | Show all active resource locks |
 | `locks <filter>` | Show locks matching path |
 | `lock <resource>` | Acquire exclusive lock |
@@ -594,9 +578,21 @@ Source-based firewall: explicit allow/deny rules + automatic rate limiting (conf
 
 GPIO for IoT/embedded via Linux sysfs. Export/unexport pins, set direction (in/out), read/write values. Auto-detects hardware availability, falls back to simulation mode. Designed for Raspberry Pi, BeagleBone, etc.
 
-### mod_process — Command Execution
+### mod_process — Command Execution + Process Introspection
 
 Sandboxed system command execution via popen. Configurable allowed command whitelist (default: ls, cat, df, free, uname, ps, etc.). Rejects dangerous patterns (rm -rf, mkfs, dd). Admin-only access.
+
+Also exposes read-only `/proc` introspection used by the CLI `top` builtin and reachable from any client:
+
+| Path | Returns |
+|---|---|
+| `/process/resources/portal_top` | Portal-internal view: process header (PID/RSS/VSize/CPU%/state), module table (name version state #paths #msgs msgs/min last), thread list with per-thread CPU% and name (from `/proc/self/task/<tid>/comm`) |
+| `/process/resources/list` | All host PIDs (`pid ppid state %cpu %mem rss comm`) |
+| `/process/resources/top?n=N&sort=cpu\|mem\|pid` | Top N host processes sorted |
+| `/process/resources/threads?pid=N` | Threads of a target PID (default: portal's own) |
+| `/process/resources/self` | Portal's PID, PPID, RSS, VSize, thread count |
+
+CPU% is computed from a two-sample delta against `/proc/stat` total jiffies (first call returns 0%, subsequent calls show live usage). MEM% from `/proc/meminfo MemTotal`. msgs/min in `portal_top` is computed per module from a wall-clock delta against the previous sample.
 
 ### mod_kv — Persistent Key-Value Store
 

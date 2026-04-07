@@ -1,20 +1,3 @@
-<!--
-  Author: Germán Luis Aracil Boned <garacilb@gmail.com>
-
-  This program is free software; you can redistribute it and/or modify
-  it under the terms of the GNU General Public License as published by
-  the Free Software Foundation; either version 2 of the License, or
-  (at your option) any later version.
-
-  This program is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-  GNU General Public License for more details.
-
-  You should have received a copy of the GNU General Public License
-  along with this program; if not, see <https://www.gnu.org/licenses/>.
--->
-
 # Portal Core API Reference
 
 Complete reference for all interfaces, types, and conventions used by Portal modules.
@@ -237,6 +220,26 @@ int  core->module_loaded(core, "db");
 ```
 
 Returns 1 if loaded, 0 if not. Always check before sending to a dependency.
+
+### Observability (read-only enumeration)
+
+```c
+/* Walk all loaded modules with their msg counters */
+int  core->module_iter(core, my_module_cb, userdata);
+
+/* Walk all registered paths with their owning module */
+int  core->path_iter(core, my_path_cb, userdata);
+```
+
+**Callback signatures:**
+```c
+void my_module_cb(const char *name, const char *version, int loaded,
+                  uint64_t msg_count, uint64_t last_msg_us, void *ud);
+
+void my_path_cb(const char *path, const char *module_name, void *ud);
+```
+
+`msg_count` is incremented on every dispatch into the module (single-threaded, no locks). `last_msg_us` is a monotonic microsecond timestamp of the last call. Use these for observability views like the CLI `top` builtin (implemented in `mod_process` → `/process/resources/portal_top`). These iterators are read-only — they cannot mutate core state.
 
 ### Event Loop (I/O)
 
