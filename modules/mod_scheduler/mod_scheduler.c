@@ -1,21 +1,4 @@
 /*
- * Author: Germán Luis Aracil Boned <garacilb@gmail.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, see <https://www.gnu.org/licenses/>.
- */
-
-/*
  * mod_scheduler — One-shot delayed task scheduler
  *
  * Schedule path calls at specific times or after delays.
@@ -119,12 +102,15 @@ int portal_module_load(portal_core_t *core)
 
     core->path_register(core, "/scheduler/resources/status", "scheduler");
     core->path_set_access(core, "/scheduler/resources/status", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/scheduler/resources/status", "One-shot scheduler: task count");
     core->path_register(core, "/scheduler/resources/tasks", "scheduler");
     core->path_set_access(core, "/scheduler/resources/tasks", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/scheduler/resources/tasks", "List pending one-shot tasks");
     core->path_register(core, "/scheduler/functions/schedule", "scheduler");
     core->path_set_access(core, "/scheduler/functions/schedule", PORTAL_ACCESS_RW);
     core->path_register(core, "/scheduler/functions/cancel", "scheduler");
     core->path_set_access(core, "/scheduler/functions/cancel", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/scheduler/functions/cancel", "Cancel task. Header: name");
     core->path_register(core, "/scheduler/functions/check", "scheduler");
     core->path_set_access(core, "/scheduler/functions/check", PORTAL_ACCESS_RW);
 

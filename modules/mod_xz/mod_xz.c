@@ -1,21 +1,4 @@
 /*
- * Author: Germán Luis Aracil Boned <garacilb@gmail.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, see <https://www.gnu.org/licenses/>.
- */
-
-/*
  * mod_xz — XZ/LZMA compression
  *
  * Compress and decompress data using XZ (LZMA2) via liblzma.
@@ -114,10 +97,13 @@ int portal_module_load(portal_core_t *core)
 
     core->path_register(core, "/xz/resources/status", "xz");
     core->path_set_access(core, "/xz/resources/status", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/xz/resources/status", "XZ/LZMA compression: level, max size");
     core->path_register(core, "/xz/functions/compress", "xz");
     core->path_set_access(core, "/xz/functions/compress", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/xz/functions/compress", "XZ compress. Body: raw data");
     core->path_register(core, "/xz/functions/decompress", "xz");
     core->path_set_access(core, "/xz/functions/decompress", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/xz/functions/decompress", "XZ decompress. Body: compressed data");
 
     core->log(core, PORTAL_LOG_INFO, "xz",
               "XZ compression ready (level: %d, max: %zu bytes)",

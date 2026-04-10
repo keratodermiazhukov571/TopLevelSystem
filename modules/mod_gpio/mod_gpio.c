@@ -1,21 +1,4 @@
 /*
- * Author: Germán Luis Aracil Boned <garacilb@gmail.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, see <https://www.gnu.org/licenses/>.
- */
-
-/*
  * mod_gpio — GPIO pin control for IoT/embedded
  *
  * Control GPIO pins via sysfs (/sys/class/gpio) or
@@ -198,18 +181,25 @@ int portal_module_load(portal_core_t *core)
 
     core->path_register(core, "/gpio/resources/status", "gpio");
     core->path_set_access(core, "/gpio/resources/status", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/gpio/resources/status", "GPIO module: max pins, sysfs path, simulate mode");
     core->path_register(core, "/gpio/resources/pins", "gpio");
     core->path_set_access(core, "/gpio/resources/pins", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/gpio/resources/pins", "List exported GPIO pins with direction and value");
     core->path_register(core, "/gpio/functions/export", "gpio");
     core->path_set_access(core, "/gpio/functions/export", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/gpio/functions/export", "Export a GPIO pin. Header: pin (number)");
     core->path_register(core, "/gpio/functions/unexport", "gpio");
     core->path_set_access(core, "/gpio/functions/unexport", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/gpio/functions/unexport", "Unexport a GPIO pin. Header: pin");
     core->path_register(core, "/gpio/functions/direction", "gpio");
     core->path_set_access(core, "/gpio/functions/direction", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/gpio/functions/direction", "Set pin direction. Headers: pin, direction (in/out)");
     core->path_register(core, "/gpio/functions/read", "gpio");
     core->path_set_access(core, "/gpio/functions/read", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/gpio/functions/read", "Read pin value. Header: pin");
     core->path_register(core, "/gpio/functions/write", "gpio");
     core->path_set_access(core, "/gpio/functions/write", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/gpio/functions/write", "Write to pin. Headers: pin, value (0/1)");
 
     core->log(core, PORTAL_LOG_INFO, "gpio",
               "GPIO ready (sysfs: %s, simulate: %s, max: %d pins)",

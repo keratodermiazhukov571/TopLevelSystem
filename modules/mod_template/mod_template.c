@@ -1,21 +1,4 @@
 /*
- * Author: Germán Luis Aracil Boned <garacilb@gmail.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, see <https://www.gnu.org/licenses/>.
- */
-
-/*
  * mod_template — Template rendering engine
  *
  * Load templates from files, render with variable substitution.
@@ -171,10 +154,13 @@ int portal_module_load(portal_core_t *core)
 
     core->path_register(core, "/template/resources/status", "template");
     core->path_set_access(core, "/template/resources/status", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/template/resources/status", "Template engine: template count, directory");
     core->path_register(core, "/template/resources/list", "template");
     core->path_set_access(core, "/template/resources/list", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/template/resources/list", "List available templates");
     core->path_register(core, "/template/functions/render", "template");
     core->path_set_access(core, "/template/functions/render", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/template/functions/render", "Render template. Header: name. Body: key=value variables");
     core->path_register(core, "/template/functions/reload", "template");
     core->path_set_access(core, "/template/functions/reload", PORTAL_ACCESS_RW);
     core->path_register(core, "/template/functions/store", "template");

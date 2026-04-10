@@ -1,21 +1,4 @@
 /*
- * Author: Germán Luis Aracil Boned <garacilb@gmail.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, see <https://www.gnu.org/licenses/>.
- */
-
-/*
  * mod_sysinfo — System information
  *
  * Exposes hostname, OS details, kernel version,
@@ -63,10 +46,13 @@ int portal_module_load(portal_core_t *core)
     core->path_set_access(core, "/sysinfo/resources/status", PORTAL_ACCESS_READ);
     core->path_register(core, "/sysinfo/resources/os", "sysinfo");
     core->path_set_access(core, "/sysinfo/resources/os", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/sysinfo/resources/os", "OS info: name, version, kernel, architecture");
     core->path_register(core, "/sysinfo/resources/network", "sysinfo");
     core->path_set_access(core, "/sysinfo/resources/network", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/sysinfo/resources/network", "Network interfaces: IP, MAC, status");
     core->path_register(core, "/sysinfo/resources/env", "sysinfo");
     core->path_set_access(core, "/sysinfo/resources/env", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/sysinfo/resources/env", "Environment variables");
     core->path_add_label(core, "/sysinfo/resources/env", "admin");
     core->path_register(core, "/sysinfo/resources/all", "sysinfo");
     core->path_set_access(core, "/sysinfo/resources/all", PORTAL_ACCESS_READ);

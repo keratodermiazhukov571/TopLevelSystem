@@ -1,21 +1,4 @@
 /*
- * Author: Germán Luis Aracil Boned <garacilb@gmail.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, see <https://www.gnu.org/licenses/>.
- */
-
-/*
  * mod_tunnel — Port forwarding through federation
  *
  * Export local services to federation, map remote services to local ports.
@@ -686,20 +669,27 @@ int portal_module_load(portal_core_t *core)
     /* Resources (READ) */
     core->path_register(core, "/tunnel/resources/status", "tunnel");
     core->path_set_access(core, "/tunnel/resources/status", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/tunnel/resources/status", "Port forwarding: exports, maps, active tunnels");
     core->path_register(core, "/tunnel/resources/exports", "tunnel");
     core->path_set_access(core, "/tunnel/resources/exports", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/tunnel/resources/exports", "List exported local ports");
     core->path_register(core, "/tunnel/resources/maps", "tunnel");
     core->path_set_access(core, "/tunnel/resources/maps", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/tunnel/resources/maps", "List remote port mappings");
 
     /* Functions (RW) */
     core->path_register(core, "/tunnel/functions/export", "tunnel");
     core->path_set_access(core, "/tunnel/functions/export", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/tunnel/functions/export", "Export local port. Headers: port, proto, name");
     core->path_register(core, "/tunnel/functions/unexport", "tunnel");
     core->path_set_access(core, "/tunnel/functions/unexport", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/tunnel/functions/unexport", "Stop exporting port. Header: name");
     core->path_register(core, "/tunnel/functions/map", "tunnel");
     core->path_set_access(core, "/tunnel/functions/map", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/tunnel/functions/map", "Map remote port locally. Headers: peer, name, local_port");
     core->path_register(core, "/tunnel/functions/unmap", "tunnel");
     core->path_set_access(core, "/tunnel/functions/unmap", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/tunnel/functions/unmap", "Remove port mapping. Header: name");
     core->path_register(core, "/tunnel/functions/connect", "tunnel");
     core->path_set_access(core, "/tunnel/functions/connect", PORTAL_ACCESS_RW);
     core->path_register(core, "/tunnel/functions/stream", "tunnel");

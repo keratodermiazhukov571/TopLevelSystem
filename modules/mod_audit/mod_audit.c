@@ -1,21 +1,4 @@
 /*
- * Author: Germán Luis Aracil Boned <garacilb@gmail.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, see <https://www.gnu.org/licenses/>.
- */
-
-/*
  * mod_audit — Audit trail logging
  *
  * Records all significant events with timestamp, user, path, method.
@@ -147,10 +130,12 @@ int portal_module_load(portal_core_t *core)
 
     core->path_register(core, "/audit/resources/status", "audit");
     core->path_set_access(core, "/audit/resources/status", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/audit/resources/status", "Audit trail: entry count, max entries, file path");
     core->path_register(core, "/audit/resources/log", "audit");
     core->path_set_access(core, "/audit/resources/log", PORTAL_ACCESS_READ);
     core->path_register(core, "/audit/functions/search", "audit");
     core->path_set_access(core, "/audit/functions/search", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/audit/functions/search", "Search audit trail. Header: pattern, optional: limit");
     core->path_register(core, "/audit/functions/record", "audit");
     core->path_set_access(core, "/audit/functions/record", PORTAL_ACCESS_RW);
     core->path_register(core, "/audit/functions/clear", "audit");

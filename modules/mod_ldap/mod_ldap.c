@@ -1,21 +1,4 @@
 /*
- * Author: Germán Luis Aracil Boned <garacilb@gmail.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, see <https://www.gnu.org/licenses/>.
- */
-
-/*
  * mod_ldap — LDAP/Active Directory authentication
  *
  * Authenticate users against an LDAP server.
@@ -203,8 +186,10 @@ int portal_module_load(portal_core_t *core)
 
     core->path_register(core, "/ldap/resources/status", "ldap");
     core->path_set_access(core, "/ldap/resources/status", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/ldap/resources/status", "LDAP client: server, port, base DN");
     core->path_register(core, "/ldap/functions/auth", "ldap");
     core->path_set_access(core, "/ldap/functions/auth", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/ldap/functions/auth", "LDAP authentication. Headers: user, password");
     core->path_register(core, "/ldap/functions/test", "ldap");
     core->path_set_access(core, "/ldap/functions/test", PORTAL_ACCESS_RW);
     core->path_add_label(core, "/ldap/functions/test", "admin");

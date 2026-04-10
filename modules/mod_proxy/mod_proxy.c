@@ -1,21 +1,4 @@
 /*
- * Author: Germán Luis Aracil Boned <garacilb@gmail.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, see <https://www.gnu.org/licenses/>.
- */
-
-/*
  * mod_proxy — HTTP reverse proxy
  *
  * Forward requests to upstream HTTP servers.
@@ -189,12 +172,16 @@ int portal_module_load(portal_core_t *core)
 
     core->path_register(core, "/proxy/resources/status", "proxy");
     core->path_set_access(core, "/proxy/resources/status", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/proxy/resources/status", "Reverse proxy: route count, timeout");
     core->path_register(core, "/proxy/resources/routes", "proxy");
     core->path_set_access(core, "/proxy/resources/routes", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/proxy/resources/routes", "List proxy routes with targets");
     core->path_register(core, "/proxy/functions/add", "proxy");
     core->path_set_access(core, "/proxy/functions/add", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/proxy/functions/add", "Add proxy route. Headers: path, target (URL)");
     core->path_register(core, "/proxy/functions/remove", "proxy");
     core->path_set_access(core, "/proxy/functions/remove", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/proxy/functions/remove", "Remove route. Header: path");
     core->path_register(core, "/proxy/functions/forward", "proxy");
     core->path_set_access(core, "/proxy/functions/forward", PORTAL_ACCESS_RW);
 

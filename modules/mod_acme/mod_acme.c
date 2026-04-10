@@ -1,21 +1,4 @@
 /*
- * Author: Germán Luis Aracil Boned <garacilb@gmail.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, see <https://www.gnu.org/licenses/>.
- */
-
-/*
  * mod_acme — ACME/Let's Encrypt TLS certificate automation
  *
  * Automates TLS certificate provisioning via the ACME protocol.
@@ -191,12 +174,14 @@ int portal_module_load(portal_core_t *core)
 
     core->path_register(core, "/acme/resources/status", "acme");
     core->path_set_access(core, "/acme/resources/status", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/acme/resources/status", "ACME/Let's Encrypt: server, email, cert directory");
     core->path_register(core, "/acme/resources/certs", "acme");
     core->path_set_access(core, "/acme/resources/certs", PORTAL_ACCESS_READ);
     core->path_register(core, "/acme/functions/request", "acme");
     core->path_set_access(core, "/acme/functions/request", PORTAL_ACCESS_RW);
     core->path_register(core, "/acme/functions/renew", "acme");
     core->path_set_access(core, "/acme/functions/renew", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/acme/functions/renew", "Renew certificate. Header: domain");
     core->path_register(core, "/acme/functions/check", "acme");
     core->path_set_access(core, "/acme/functions/check", PORTAL_ACCESS_RW);
 

@@ -1,21 +1,4 @@
 /*
- * Author: Germán Luis Aracil Boned <garacilb@gmail.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, see <https://www.gnu.org/licenses/>.
- */
-
-/*
  * mod_serial — RS232/serial port communication
  *
  * Open, configure, read, write serial ports via the path system.
@@ -136,16 +119,22 @@ int portal_module_load(portal_core_t *core)
 
     core->path_register(core, "/serial/resources/status", "serial");
     core->path_set_access(core, "/serial/resources/status", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/serial/resources/status", "Serial port module: max ports, active count");
     core->path_register(core, "/serial/resources/ports", "serial");
     core->path_set_access(core, "/serial/resources/ports", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/serial/resources/ports", "List available serial ports");
     core->path_register(core, "/serial/functions/open", "serial");
     core->path_set_access(core, "/serial/functions/open", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/serial/functions/open", "Open serial port. Headers: port, baud, optional: bits, parity, stop");
     core->path_register(core, "/serial/functions/close", "serial");
     core->path_set_access(core, "/serial/functions/close", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/serial/functions/close", "Close serial port. Header: port");
     core->path_register(core, "/serial/functions/write", "serial");
     core->path_set_access(core, "/serial/functions/write", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/serial/functions/write", "Write to serial port. Header: port. Body: data");
     core->path_register(core, "/serial/functions/read", "serial");
     core->path_set_access(core, "/serial/functions/read", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/serial/functions/read", "Read from serial port. Header: port");
 
     core->log(core, PORTAL_LOG_INFO, "serial",
               "Serial port module ready (max: %d ports)", g_max_ports);

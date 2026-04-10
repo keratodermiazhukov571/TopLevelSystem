@@ -1,21 +1,4 @@
 /*
- * Author: Germán Luis Aracil Boned <garacilb@gmail.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, see <https://www.gnu.org/licenses/>.
- */
-
-/*
  * mod_metrics — System metrics collection
  *
  * Reads system metrics from /proc on Linux:
@@ -187,14 +170,19 @@ int portal_module_load(portal_core_t *core)
 
     core->path_register(core, "/metrics/resources/status", "metrics");
     core->path_set_access(core, "/metrics/resources/status", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/metrics/resources/status", "System metrics overview");
     core->path_register(core, "/metrics/resources/cpu", "metrics");
     core->path_set_access(core, "/metrics/resources/cpu", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/metrics/resources/cpu", "CPU usage: user, system, idle %");
     core->path_register(core, "/metrics/resources/memory", "metrics");
     core->path_set_access(core, "/metrics/resources/memory", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/metrics/resources/memory", "Memory: total, used, free, cached, available");
     core->path_register(core, "/metrics/resources/disk", "metrics");
     core->path_set_access(core, "/metrics/resources/disk", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/metrics/resources/disk", "Disk usage per mount point");
     core->path_register(core, "/metrics/resources/load", "metrics");
     core->path_set_access(core, "/metrics/resources/load", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/metrics/resources/load", "Load averages: 1min, 5min, 15min");
     core->path_register(core, "/metrics/resources/all", "metrics");
     core->path_set_access(core, "/metrics/resources/all", PORTAL_ACCESS_READ);
 

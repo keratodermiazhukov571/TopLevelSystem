@@ -1,21 +1,4 @@
 /*
- * Author: Germán Luis Aracil Boned <garacilb@gmail.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, see <https://www.gnu.org/licenses/>.
- */
-
-/*
  * mod_shm — Shared Memory Tables
  *
  * Named shared memory regions accessible via paths.
@@ -90,16 +73,22 @@ int portal_module_load(portal_core_t *core)
 
     core->path_register(core, "/shm/resources/status", "shm");
     core->path_set_access(core, "/shm/resources/status", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/shm/resources/status", "Shared memory: max region size, region count");
     core->path_register(core, "/shm/resources/regions", "shm");
     core->path_set_access(core, "/shm/resources/regions", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/shm/resources/regions", "List shared memory regions");
     core->path_register(core, "/shm/functions/create", "shm");
     core->path_set_access(core, "/shm/functions/create", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/shm/functions/create", "Create SHM region. Headers: name, size");
     core->path_register(core, "/shm/functions/write", "shm");
     core->path_set_access(core, "/shm/functions/write", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/shm/functions/write", "Write to SHM region. Header: name. Body: data");
     core->path_register(core, "/shm/functions/read", "shm");
     core->path_set_access(core, "/shm/functions/read", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/shm/functions/read", "Read from SHM region. Header: name");
     core->path_register(core, "/shm/functions/destroy", "shm");
     core->path_set_access(core, "/shm/functions/destroy", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/shm/functions/destroy", "Destroy SHM region. Header: name");
 
     core->log(core, PORTAL_LOG_INFO, "shm",
               "Shared memory ready (max region: %zuKB)", g_max_size / 1024);

@@ -1,21 +1,4 @@
 /*
- * Author: Germán Luis Aracil Boned <garacilb@gmail.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, see <https://www.gnu.org/licenses/>.
- */
-
-/*
  * mod_mqtt — Lightweight MQTT Broker
  *
  * Accepts MQTT client connections and bridges topics
@@ -242,6 +225,7 @@ int portal_module_load(portal_core_t *core)
     core->fd_add(core, g_listen_fd, EV_READ, on_mqtt_accept, NULL);
     core->path_register(core, "/mqtt/resources/status", "mqtt");
     core->path_set_access(core, "/mqtt/resources/status", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/mqtt/resources/status", "MQTT broker: port, connected clients, topics");
     core->path_register(core, "/mqtt/resources/clients", "mqtt");
     core->path_set_access(core, "/mqtt/resources/clients", PORTAL_ACCESS_READ);
     core->log(core, PORTAL_LOG_INFO, "mqtt", "MQTT broker on port %d", g_port);

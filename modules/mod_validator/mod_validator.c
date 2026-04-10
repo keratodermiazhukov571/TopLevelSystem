@@ -1,21 +1,4 @@
 /*
- * Author: Germán Luis Aracil Boned <garacilb@gmail.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, see <https://www.gnu.org/licenses/>.
- */
-
-/*
  * mod_validator — Input validation utilities
  *
  * Validate common input formats: email, IP, URL, JSON,
@@ -153,20 +136,28 @@ int portal_module_load(portal_core_t *core)
 
     core->path_register(core, "/validator/resources/status", "validator");
     core->path_set_access(core, "/validator/resources/status", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/validator/resources/status", "Validator status");
     core->path_register(core, "/validator/functions/email", "validator");
     core->path_set_access(core, "/validator/functions/email", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/validator/functions/email", "Validate email address. Header: value");
     core->path_register(core, "/validator/functions/ip", "validator");
     core->path_set_access(core, "/validator/functions/ip", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/validator/functions/ip", "Validate IP address. Header: value");
     core->path_register(core, "/validator/functions/url", "validator");
     core->path_set_access(core, "/validator/functions/url", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/validator/functions/url", "Validate URL. Header: value");
     core->path_register(core, "/validator/functions/json", "validator");
     core->path_set_access(core, "/validator/functions/json", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/validator/functions/json", "Validate JSON. Body: JSON string");
     core->path_register(core, "/validator/functions/number", "validator");
     core->path_set_access(core, "/validator/functions/number", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/validator/functions/number", "Validate number in range. Headers: value, min, max");
     core->path_register(core, "/validator/functions/regex", "validator");
     core->path_set_access(core, "/validator/functions/regex", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/validator/functions/regex", "Match regex. Headers: value, pattern");
     core->path_register(core, "/validator/functions/hostname", "validator");
     core->path_set_access(core, "/validator/functions/hostname", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/validator/functions/hostname", "Validate hostname. Header: value");
 
     core->log(core, PORTAL_LOG_INFO, "validator", "Input validator ready");
     return PORTAL_MODULE_OK;

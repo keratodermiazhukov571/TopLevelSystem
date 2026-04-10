@@ -1,21 +1,4 @@
 /*
- * Author: Germán Luis Aracil Boned <garacilb@gmail.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, see <https://www.gnu.org/licenses/>.
- */
-
-/*
  * mod_kv — Persistent key-value store
  *
  * File-backed key-value store that survives restarts.
@@ -94,14 +77,19 @@ int portal_module_load(portal_core_t *core)
 
     core->path_register(core, "/kv/resources/status", "kv");
     core->path_set_access(core, "/kv/resources/status", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/kv/resources/status", "Key-value store: key count, storage path");
     core->path_register(core, "/kv/resources/keys", "kv");
     core->path_set_access(core, "/kv/resources/keys", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/kv/resources/keys", "List all persistent keys");
     core->path_register(core, "/kv/functions/get", "kv");
     core->path_set_access(core, "/kv/functions/get", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/kv/functions/get", "Get persistent key. Header: key");
     core->path_register(core, "/kv/functions/set", "kv");
     core->path_set_access(core, "/kv/functions/set", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/kv/functions/set", "Set persistent key. Headers: key, value");
     core->path_register(core, "/kv/functions/del", "kv");
     core->path_set_access(core, "/kv/functions/del", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/kv/functions/del", "Delete persistent key. Header: key");
     core->path_register(core, "/kv/functions/exists", "kv");
     core->path_set_access(core, "/kv/functions/exists", PORTAL_ACCESS_RW);
 

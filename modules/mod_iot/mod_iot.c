@@ -1,21 +1,4 @@
 /*
- * Author: Germán Luis Aracil Boned <garacilb@gmail.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, see <https://www.gnu.org/licenses/>.
- */
-
-/*
  * mod_iot — Complete IoT device management
  *
  * Discover, identify, register, control, and monitor IoT devices.
@@ -2142,24 +2125,33 @@ int portal_module_load(portal_core_t *core)
     /* Resources (READ) */
     core->path_register(core, "/iot/resources/status", "iot");
     core->path_set_access(core, "/iot/resources/status", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/iot/resources/status", "IoT manager: device count, poll interval, protocol support");
     core->path_register(core, "/iot/resources/devices", "iot");
     core->path_set_access(core, "/iot/resources/devices", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/iot/resources/devices", "List all IoT devices with status, type, IP");
 
     /* Functions (RW) */
     core->path_register(core, "/iot/functions/discover", "iot");
     core->path_set_access(core, "/iot/functions/discover", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/iot/functions/discover", "Scan network for devices. Headers: subnet, optional: brand");
     core->path_register(core, "/iot/functions/add", "iot");
     core->path_set_access(core, "/iot/functions/add", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/iot/functions/add", "Add device manually. Headers: name, ip, optional: driver, brand");
     core->path_register(core, "/iot/functions/remove", "iot");
     core->path_set_access(core, "/iot/functions/remove", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/iot/functions/remove", "Remove device. Header: name");
     core->path_register(core, "/iot/functions/on", "iot");
     core->path_set_access(core, "/iot/functions/on", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/iot/functions/on", "Turn device on. Header: name");
     core->path_register(core, "/iot/functions/off", "iot");
     core->path_set_access(core, "/iot/functions/off", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/iot/functions/off", "Turn device off. Header: name");
     core->path_register(core, "/iot/functions/toggle", "iot");
     core->path_set_access(core, "/iot/functions/toggle", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/iot/functions/toggle", "Toggle device state. Header: name");
     core->path_register(core, "/iot/functions/status", "iot");
     core->path_set_access(core, "/iot/functions/status", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/iot/functions/status", "Get device status. Header: name");
     core->path_register(core, "/iot/functions/children", "iot");
     core->path_set_access(core, "/iot/functions/children", PORTAL_ACCESS_RW);
     core->path_register(core, "/iot/functions/vacuum", "iot");
@@ -2168,6 +2160,7 @@ int portal_module_load(portal_core_t *core)
     core->path_set_access(core, "/iot/functions/bulb", PORTAL_ACCESS_RW);
     core->path_register(core, "/iot/functions/refresh", "iot");
     core->path_set_access(core, "/iot/functions/refresh", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/iot/functions/refresh", "Query all devices for live state + names");
 
     /* Set up device persistence directory */
     const char *data_dir = core->config_get(core, "core", "data_dir");

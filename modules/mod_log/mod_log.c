@@ -1,21 +1,4 @@
 /*
- * Author: Germán Luis Aracil Boned <garacilb@gmail.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, see <https://www.gnu.org/licenses/>.
- */
-
-/*
  * mod_log — Log viewer and searcher
  *
  * Access Portal instance logs via the path system.
@@ -147,12 +130,14 @@ int portal_module_load(portal_core_t *core)
 
     core->path_register(core, "/log/resources/status", "log");
     core->path_set_access(core, "/log/resources/status", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/log/resources/status", "Log viewer: directory, max lines");
     core->path_register(core, "/log/resources/tail", "log");
     core->path_set_access(core, "/log/resources/tail", PORTAL_ACCESS_READ);
     core->path_register(core, "/log/resources/files", "log");
     core->path_set_access(core, "/log/resources/files", PORTAL_ACCESS_READ);
     core->path_register(core, "/log/functions/search", "log");
     core->path_set_access(core, "/log/functions/search", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/log/functions/search", "Search logs. Header: pattern, optional: lines");
     core->path_register(core, "/log/functions/rotate", "log");
     core->path_set_access(core, "/log/functions/rotate", PORTAL_ACCESS_RW);
     core->path_add_label(core, "/log/functions/rotate", "admin");

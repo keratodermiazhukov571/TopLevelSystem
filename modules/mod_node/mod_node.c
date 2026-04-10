@@ -1478,8 +1478,10 @@ int portal_module_load(portal_core_t *core)
 
     core->path_register(core, "/node/resources/status", "node");
     core->path_set_access(core, "/node/resources/status", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/node/resources/status", "Federation node: name, port, TLS, peer count, threads/peer");
     core->path_register(core, "/node/resources/peers", "node");
     core->path_set_access(core, "/node/resources/peers", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/node/resources/peers", "Connected peers: name, IP, state, workers, traffic stats");
     core->path_register(core, "/node/resources/peer/*", "node");
     core->path_set_access(core, "/node/resources/peer/*", PORTAL_ACCESS_READ);
 
@@ -1509,12 +1511,16 @@ int portal_module_load(portal_core_t *core)
     core->path_set_access(core, "/node/functions/pipe", PORTAL_ACCESS_RW);
     core->path_register(core, "/node/functions/ping", "node");
     core->path_set_access(core, "/node/functions/ping", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/node/functions/ping", "Measure RTT to peer. Header: name (or 'all')");
     core->path_register(core, "/node/functions/location", "node");
     core->path_set_access(core, "/node/functions/location", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/node/functions/location", "Set node location text. Header: name");
     core->path_register(core, "/node/functions/geolocate", "node");
     core->path_set_access(core, "/node/functions/geolocate", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/node/functions/geolocate", "Auto-detect location from public IP");
     core->path_register(core, "/node/functions/trace", "node");
     core->path_set_access(core, "/node/functions/trace", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/node/functions/trace", "Traceroute through federation. Header: path");
 #ifdef HAS_SSL
     core->path_register(core, "/node/functions/reload_tls", "node");
     core->path_set_access(core, "/node/functions/reload_tls", PORTAL_ACCESS_RW);

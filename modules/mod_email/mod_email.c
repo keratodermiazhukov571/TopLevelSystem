@@ -1,21 +1,4 @@
 /*
- * Author: Germán Luis Aracil Boned <garacilb@gmail.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, see <https://www.gnu.org/licenses/>.
- */
-
-/*
  * mod_email — Email sender (SMTP)
  *
  * Send emails via SMTP through the path system.
@@ -156,8 +139,10 @@ int portal_module_load(portal_core_t *core)
 
     core->path_register(core, "/email/resources/status", "email");
     core->path_set_access(core, "/email/resources/status", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/email/resources/status", "Email sender status: SMTP host, from address");
     core->path_register(core, "/email/functions/send", "email");
     core->path_set_access(core, "/email/functions/send", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/email/functions/send", "Send email. Headers: to, subject. Body: message text");
 
     core->log(core, PORTAL_LOG_INFO, "email",
               "Email ready (SMTP: %s:%d, from: %s)",

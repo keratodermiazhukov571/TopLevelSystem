@@ -1,21 +1,4 @@
 /*
- * Author: Germán Luis Aracil Boned <garacilb@gmail.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, see <https://www.gnu.org/licenses/>.
- */
-
-/*
  * mod_myapp — Example application module for Portal
  *
  * Demonstrates all key module features:
@@ -57,19 +40,23 @@ int portal_module_load(portal_core_t *core)
     /* Public resources — anyone can read */
     core->path_register(core, "/myapp/resources/status", "myapp");
     core->path_set_access(core, "/myapp/resources/status", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/myapp/resources/status", "Example app: version, message, counter, deps");
     core->path_register(core, "/myapp/resources/counter", "myapp");
     core->path_set_access(core, "/myapp/resources/counter", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/myapp/resources/counter", "Current counter value");
     core->path_register(core, "/myapp/resources/message", "myapp");
     core->path_set_access(core, "/myapp/resources/message", PORTAL_ACCESS_READ);
 
     /* Admin-only function — requires "admin" group */
     core->path_register(core, "/myapp/functions/reset", "myapp");
     core->path_set_access(core, "/myapp/functions/reset", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/myapp/functions/reset", "Reset counter to zero");
     core->path_add_label(core, "/myapp/functions/reset", "admin");
 
     /* Public function */
     core->path_register(core, "/myapp/functions/increment", "myapp");
     core->path_set_access(core, "/myapp/functions/increment", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/myapp/functions/increment", "Increment counter and return new value");
 
     /* Register an event that we will emit */
     core->event_register(core, "/events/myapp/counter_changed",

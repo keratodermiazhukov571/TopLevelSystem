@@ -472,26 +472,32 @@ int portal_module_load(portal_core_t *core)
     /* Register paths */
     core->path_register(core, "/shell/functions/exec", "shell");
     core->path_set_access(core, "/shell/functions/exec", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/shell/functions/exec", "Execute a command (stateless). Header: cmd, optional: cwd, timeout");
     core->path_add_label(core, "/shell/functions/exec", "admin");
 
     core->path_register(core, "/shell/functions/open", "shell");
     core->path_set_access(core, "/shell/functions/open", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/shell/functions/open", "Open PTY session. Returns session_id. Optional headers: rows, cols");
     core->path_add_label(core, "/shell/functions/open", "admin");
 
     core->path_register(core, "/shell/functions/write", "shell");
     core->path_set_access(core, "/shell/functions/write", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/shell/functions/write", "Send input to PTY. Header: session. Body: raw bytes");
     core->path_add_label(core, "/shell/functions/write", "admin");
 
     core->path_register(core, "/shell/functions/read", "shell");
     core->path_set_access(core, "/shell/functions/read", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/shell/functions/read", "Read output from PTY. Header: session");
     core->path_add_label(core, "/shell/functions/read", "admin");
 
     core->path_register(core, "/shell/functions/close", "shell");
     core->path_set_access(core, "/shell/functions/close", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/shell/functions/close", "Close PTY session. Header: session");
     core->path_add_label(core, "/shell/functions/close", "admin");
 
     core->path_register(core, "/shell/functions/resize", "shell");
     core->path_set_access(core, "/shell/functions/resize", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/shell/functions/resize", "Resize PTY terminal. Headers: session, rows, cols");
     core->path_add_label(core, "/shell/functions/resize", "admin");
 
     /* Events */

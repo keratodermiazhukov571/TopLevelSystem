@@ -1,21 +1,4 @@
 /*
- * Author: Germán Luis Aracil Boned <garacilb@gmail.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, see <https://www.gnu.org/licenses/>.
- */
-
-/*
  * mod_cache — In-memory key-value store with TTL
  *
  * Ultra-fast hash table cache accessible via paths.
@@ -201,16 +184,22 @@ int portal_module_load(portal_core_t *core)
 
     core->path_register(core, "/cache/resources/status", "cache");
     core->path_set_access(core, "/cache/resources/status", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/cache/resources/status", "Cache stats: entries, hits, misses, memory");
     core->path_register(core, "/cache/resources/keys", "cache");
     core->path_set_access(core, "/cache/resources/keys", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/cache/resources/keys", "List all cache keys with TTL");
     core->path_register(core, "/cache/functions/get", "cache");
     core->path_set_access(core, "/cache/functions/get", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/cache/functions/get", "Get cache value. Header: key");
     core->path_register(core, "/cache/functions/set", "cache");
     core->path_set_access(core, "/cache/functions/set", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/cache/functions/set", "Set cache key. Headers: key, value, optional: ttl (seconds)");
     core->path_register(core, "/cache/functions/del", "cache");
     core->path_set_access(core, "/cache/functions/del", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/cache/functions/del", "Delete cache key. Header: key");
     core->path_register(core, "/cache/functions/flush", "cache");
     core->path_set_access(core, "/cache/functions/flush", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/cache/functions/flush", "Clear all cache entries");
 
     core->log(core, PORTAL_LOG_INFO, "cache",
               "Cache ready (max: %d entries)", g_max);

@@ -1,21 +1,4 @@
 /*
- * Author: Germán Luis Aracil Boned <garacilb@gmail.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, see <https://www.gnu.org/licenses/>.
- */
-
-/*
  * mod_crypto — Cryptographic utilities
  *
  * Hash functions (SHA-256, MD5), Base64 encode/decode,
@@ -220,8 +203,10 @@ int portal_module_load(portal_core_t *core)
     core->path_set_access(core, "/crypto/resources/status", PORTAL_ACCESS_READ);
     core->path_register(core, "/crypto/functions/sha256", "crypto");
     core->path_set_access(core, "/crypto/functions/sha256", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/crypto/functions/sha256", "SHA-256 hash. Body: data to hash");
     core->path_register(core, "/crypto/functions/md5", "crypto");
     core->path_set_access(core, "/crypto/functions/md5", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/crypto/functions/md5", "MD5 hash. Body: data to hash");
     core->path_register(core, "/crypto/functions/base64enc", "crypto");
     core->path_set_access(core, "/crypto/functions/base64enc", PORTAL_ACCESS_RW);
     core->path_register(core, "/crypto/functions/base64dec", "crypto");

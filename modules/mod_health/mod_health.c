@@ -1,21 +1,4 @@
 /*
- * Author: Germán Luis Aracil Boned <garacilb@gmail.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, see <https://www.gnu.org/licenses/>.
- */
-
-/*
  * mod_health — Health check system for Portal
  *
  * Standard liveness/readiness probes compatible with
@@ -49,12 +32,16 @@ int portal_module_load(portal_core_t *core)
 
     core->path_register(core, "/health/resources/live", "health");
     core->path_set_access(core, "/health/resources/live", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/health/resources/live", "Liveness probe: 200 if core running (k8s compatible)");
     core->path_register(core, "/health/resources/ready", "health");
     core->path_set_access(core, "/health/resources/ready", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/health/resources/ready", "Readiness probe: 200 if all modules healthy");
     core->path_register(core, "/health/resources/status", "health");
     core->path_set_access(core, "/health/resources/status", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/health/resources/status", "Detailed per-module health status");
     core->path_register(core, "/health/resources/uptime", "health");
     core->path_set_access(core, "/health/resources/uptime", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/health/resources/uptime", "Seconds since Portal started");
 
     core->log(core, PORTAL_LOG_INFO, "health", "Health checks ready");
     return PORTAL_MODULE_OK;

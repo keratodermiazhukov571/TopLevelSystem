@@ -507,6 +507,7 @@ int portal_module_load(portal_core_t *core)
 
     core->path_register(core, "/process/resources/status", "process");
     core->path_set_access(core, "/process/resources/status", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/process/resources/status", "Process executor: allowed commands, timeout");
     core->path_register(core, "/process/resources/allowed", "process");
     core->path_set_access(core, "/process/resources/allowed", PORTAL_ACCESS_READ);
     core->path_register(core, "/process/resources/list", "process");
@@ -519,8 +520,10 @@ int portal_module_load(portal_core_t *core)
     core->path_set_access(core, "/process/resources/self", PORTAL_ACCESS_READ);
     core->path_register(core, "/process/resources/portal_top", "process");
     core->path_set_access(core, "/process/resources/portal_top", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/process/resources/portal_top", "Portal-internal process viewer: modules, threads, msg rate");
     core->path_register(core, "/process/functions/exec", "process");
     core->path_set_access(core, "/process/functions/exec", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/process/functions/exec", "Execute system command (sandboxed). Header: cmd");
     core->path_add_label(core, "/process/functions/exec", "admin");
 
     /* Init /proc introspection state */

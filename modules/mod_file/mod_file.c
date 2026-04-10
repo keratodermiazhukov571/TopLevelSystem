@@ -1,21 +1,4 @@
 /*
- * Author: Germán Luis Aracil Boned <garacilb@gmail.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, see <https://www.gnu.org/licenses/>.
- */
-
-/*
  * mod_file — Filesystem operations
  *
  * Read, write, list, delete, info for files within a sandboxed base directory.
@@ -88,16 +71,22 @@ int portal_module_load(portal_core_t *core)
 
     core->path_register(core, "/file/resources/status", "file");
     core->path_set_access(core, "/file/resources/status", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/file/resources/status", "File module: base path, max file size");
     core->path_register(core, "/file/functions/read", "file");
     core->path_set_access(core, "/file/functions/read", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/file/functions/read", "Read file. Header: path (relative to base)");
     core->path_register(core, "/file/functions/write", "file");
     core->path_set_access(core, "/file/functions/write", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/file/functions/write", "Write file. Header: path. Body: content");
     core->path_register(core, "/file/functions/list", "file");
     core->path_set_access(core, "/file/functions/list", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/file/functions/list", "List files. Header: path (directory)");
     core->path_register(core, "/file/functions/delete", "file");
     core->path_set_access(core, "/file/functions/delete", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/file/functions/delete", "Delete file. Header: path");
     core->path_register(core, "/file/functions/info", "file");
     core->path_set_access(core, "/file/functions/info", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/file/functions/info", "File info: size, modified time. Header: path");
     core->path_register(core, "/file/functions/mkdir", "file");
     core->path_set_access(core, "/file/functions/mkdir", PORTAL_ACCESS_RW);
 

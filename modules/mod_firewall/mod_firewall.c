@@ -1,21 +1,4 @@
 /*
- * Author: Germán Luis Aracil Boned <garacilb@gmail.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, see <https://www.gnu.org/licenses/>.
- */
-
-/*
  * mod_firewall — Rate limiting and IP/source filtering
  *
  * Track request rates per source (IP or user).
@@ -181,18 +164,23 @@ int portal_module_load(portal_core_t *core)
 
     core->path_register(core, "/firewall/resources/status", "firewall");
     core->path_set_access(core, "/firewall/resources/status", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/firewall/resources/status", "Rate limiter status: rules, blocked sources");
     core->path_register(core, "/firewall/resources/rules", "firewall");
     core->path_set_access(core, "/firewall/resources/rules", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/firewall/resources/rules", "List all firewall rules");
     core->path_register(core, "/firewall/resources/blocked", "firewall");
     core->path_set_access(core, "/firewall/resources/blocked", PORTAL_ACCESS_READ);
     core->path_register(core, "/firewall/functions/allow", "firewall");
     core->path_set_access(core, "/firewall/functions/allow", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/firewall/functions/allow", "Allow a source. Header: source");
     core->path_register(core, "/firewall/functions/deny", "firewall");
     core->path_set_access(core, "/firewall/functions/deny", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/firewall/functions/deny", "Block a source. Header: source (IP or pattern)");
     core->path_register(core, "/firewall/functions/remove", "firewall");
     core->path_set_access(core, "/firewall/functions/remove", PORTAL_ACCESS_RW);
     core->path_register(core, "/firewall/functions/check", "firewall");
     core->path_set_access(core, "/firewall/functions/check", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/firewall/functions/check", "Check if source blocked. Header: source");
     core->path_register(core, "/firewall/functions/clear", "firewall");
     core->path_set_access(core, "/firewall/functions/clear", PORTAL_ACCESS_RW);
     core->path_add_label(core, "/firewall/functions/clear", "admin");
