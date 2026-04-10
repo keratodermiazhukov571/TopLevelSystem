@@ -46,10 +46,10 @@ typedef struct {
     int                top_active;   /* 1 = interactive `top` running */
     char               top_sort;     /* 'c'=cpu, 'm'=mem, 'p'=pid */
     int                top_threads;  /* 0/1 — show threads instead of procs */
-    /* Shell mode */
-    int                shell_active; /* 1 = interactive remote shell running */
-    char               shell_peer[64]; /* federation peer name (empty = local) */
-    char               shell_cwd[256]; /* virtual cwd for stateful-feel shell */
+    /* Shell mode (PTY session) */
+    int                shell_active;    /* 1 = PTY shell running */
+    char               shell_peer[64];  /* federation peer (empty = local) */
+    char               shell_session[32]; /* PTY session_id from mod_shell */
     cli_line_editor_t  editor;
 } cli_client_t;
 
@@ -95,11 +95,7 @@ static void send_prompt(int fd)
 {
     cli_client_t *c = find_client(fd);
     if (c && c->shell_active) {
-        char buf[384];
-        const char *host = c->shell_peer[0] ? c->shell_peer : "local";
-        const char *cwd = c->shell_cwd[0] ? c->shell_cwd : "~";
-        snprintf(buf, sizeof(buf), "root@%s:%s# ", host, cwd);
-        send_str(fd, buf);
+        return; /* PTY session provides its own prompt */
     } else if (c && strcmp(c->cwd, "/") != 0) {
         char buf[PORTAL_MAX_PATH_LEN + 16];
         snprintf(buf, sizeof(buf), "portal:%s> ", c->cwd);
@@ -726,68 +722,74 @@ static void handle_command(int fd, char *line)
         return;
     }
 
-    /* ── Shell mode: intercept all input ── */
+    /* ── Shell PTY mode: intercept all input, send to PTY session ── */
     cli_client_t *sh = find_client(fd);
     if (sh && sh->shell_active) {
         if (strcmp(line, "exit") == 0) {
+            /* Close PTY session */
+            char spath[256];
+            if (sh->shell_peer[0])
+                snprintf(spath, sizeof(spath), "/%s/shell/functions/close", sh->shell_peer);
+            else
+                snprintf(spath, sizeof(spath), "/shell/functions/close");
+
+            portal_msg_t *cm = portal_msg_alloc();
+            portal_resp_t *cr = portal_resp_alloc();
+            if (cm && cr) {
+                portal_msg_set_path(cm, spath);
+                portal_msg_set_method(cm, PORTAL_METHOD_CALL);
+                portal_msg_add_header(cm, "session", sh->shell_session);
+                g_core->send(g_core, cm, cr);
+                portal_msg_free(cm); portal_resp_free(cr);
+            }
             sh->shell_active = 0;
             sh->shell_peer[0] = '\0';
+            sh->shell_session[0] = '\0';
             send_str(fd, "Disconnected\n");
             send_prompt(fd);
             return;
         }
 
-        /* Track virtual cwd for `cd` commands */
-        if (strncmp(line, "cd ", 3) == 0 || strcmp(line, "cd") == 0) {
-            const char *dir = strlen(line) > 3 ? line + 3 : "/";
-            if (dir[0] == '/')
-                snprintf(sh->shell_cwd, sizeof(sh->shell_cwd), "%s", dir);
-            else
-                snprintf(sh->shell_cwd, sizeof(sh->shell_cwd), "%.120s/%.120s",
-                         strcmp(sh->shell_cwd, "/") == 0 ? "" : sh->shell_cwd, dir);
-        }
-
-        /* Build the path for shell exec */
+        /* Write input + newline to PTY */
         char spath[256];
         if (sh->shell_peer[0])
-            snprintf(spath, sizeof(spath), "/%s/shell/functions/exec", sh->shell_peer);
+            snprintf(spath, sizeof(spath), "/%s/shell/functions/write", sh->shell_peer);
         else
-            snprintf(spath, sizeof(spath), "/shell/functions/exec");
+            snprintf(spath, sizeof(spath), "/shell/functions/write");
 
-        portal_msg_t *sm = portal_msg_alloc();
-        portal_resp_t *sr = portal_resp_alloc();
-        if (sm && sr) {
-            portal_msg_set_path(sm, spath);
-            portal_msg_set_method(sm, PORTAL_METHOD_CALL);
-            portal_msg_add_header(sm, "cmd", line);
-            if (sh->shell_cwd[0] && strcmp(sh->shell_cwd, "/") != 0)
-                portal_msg_add_header(sm, "cwd", sh->shell_cwd);
+        /* Send the command + newline as raw bytes to the PTY */
+        char input[4096];
+        int ilen = snprintf(input, sizeof(input), "%s\n", line);
 
-            /* Set auth context from the CLI session */
-            if (sh->token[0]) {
-                portal_ctx_t *ctx = calloc(1, sizeof(portal_ctx_t));
-                if (ctx) {
-                    ctx->auth.user = strdup(sh->username);
-                    ctx->auth.token = strdup(sh->token);
-                    sm->ctx = ctx;
-                }
-            }
-
-            g_core->send(g_core, sm, sr);
-            if (sr->body && sr->body_len > 0)
-                write(fd, sr->body, sr->body_len);
-            portal_msg_free(sm);
-            portal_resp_free(sr);
+        portal_msg_t *wm = portal_msg_alloc();
+        portal_resp_t *wr = portal_resp_alloc();
+        if (wm && wr) {
+            portal_msg_set_path(wm, spath);
+            portal_msg_set_method(wm, PORTAL_METHOD_CALL);
+            portal_msg_add_header(wm, "session", sh->shell_session);
+            portal_msg_set_body(wm, input, (size_t)ilen);
+            g_core->send(g_core, wm, wr);
+            portal_msg_free(wm); portal_resp_free(wr);
         }
 
-        /* Shell prompt */
-        {
-            char sprompt[384];
-            const char *host = sh->shell_peer[0] ? sh->shell_peer : "local";
-            const char *cwd = sh->shell_cwd[0] ? sh->shell_cwd : "~";
-            snprintf(sprompt, sizeof(sprompt), "root@%.60s:%.120s# ", host, cwd);
-            send_str(fd, sprompt);
+        /* Read output from PTY */
+        if (sh->shell_peer[0])
+            snprintf(spath, sizeof(spath), "/%s/shell/functions/read", sh->shell_peer);
+        else
+            snprintf(spath, sizeof(spath), "/shell/functions/read");
+
+        portal_msg_t *rm = portal_msg_alloc();
+        portal_resp_t *rr = portal_resp_alloc();
+        if (rm && rr) {
+            portal_msg_set_path(rm, spath);
+            portal_msg_set_method(rm, PORTAL_METHOD_CALL);
+            portal_msg_add_header(rm, "session", sh->shell_session);
+            g_core->send(g_core, rm, rr);
+            if (rr->body && rr->body_len > 0)
+                write(fd, rr->body, rr->body_len);
+            portal_msg_free(rm); portal_resp_free(rr);
         }
+        /* No explicit prompt — the PTY shell provides its own prompt */
         return;
     }
 
@@ -1865,23 +1867,72 @@ static void handle_command(int fd, char *line)
             portal_msg_free(m); portal_resp_free(r);
         }
     } else if (strcmp(line, "shell") == 0 || strncmp(line, "shell ", 6) == 0) {
-        /* Enter shell mode: "shell" = local, "shell <peer>" = remote */
+        /* Enter PTY shell mode: "shell" = local, "shell <peer>" = remote */
         cli_client_t *sc = find_client(fd);
         if (sc) {
             if (strlen(line) > 6)
                 snprintf(sc->shell_peer, sizeof(sc->shell_peer), "%s", line + 6);
             else
-                sc->shell_peer[0] = '\0'; /* local */
-            sc->shell_active = 1;
-            snprintf(sc->shell_cwd, sizeof(sc->shell_cwd), "/");
-            char banner[128];
+                sc->shell_peer[0] = '\0';
+
+            /* Open a PTY session on the target */
+            char spath[256];
             if (sc->shell_peer[0])
-                snprintf(banner, sizeof(banner),
-                         "Connected to %s (type 'exit' to return)\n", sc->shell_peer);
+                snprintf(spath, sizeof(spath), "/%s/shell/functions/open", sc->shell_peer);
             else
-                snprintf(banner, sizeof(banner),
-                         "Local shell (type 'exit' to return)\n");
-            send_str(fd, banner);
+                snprintf(spath, sizeof(spath), "/shell/functions/open");
+
+            portal_msg_t *om = portal_msg_alloc();
+            portal_resp_t *or_resp = portal_resp_alloc();
+            if (om && or_resp) {
+                portal_msg_set_path(om, spath);
+                portal_msg_set_method(om, PORTAL_METHOD_CALL);
+                portal_msg_add_header(om, "rows", "24");
+                portal_msg_add_header(om, "cols", "80");
+                g_core->send(g_core, om, or_resp);
+
+                if (or_resp->status == PORTAL_OK && or_resp->body && or_resp->body_len > 0) {
+                    /* Session ID in response body */
+                    char sid[32];
+                    snprintf(sid, sizeof(sid), "%.*s",
+                             (int)(or_resp->body_len > 31 ? 31 : or_resp->body_len),
+                             (char *)or_resp->body);
+                    sid[strcspn(sid, "\r\n")] = '\0';
+                    snprintf(sc->shell_session, sizeof(sc->shell_session), "%s", sid);
+                    sc->shell_active = 1;
+
+                    char banner[256];
+                    const char *host = sc->shell_peer[0] ? sc->shell_peer : "local";
+                    snprintf(banner, sizeof(banner),
+                             "PTY session %s on %s (type 'exit' to return)\n", sid, host);
+                    send_str(fd, banner);
+
+                    /* Read initial shell output (prompt, motd, etc.) */
+                    char rpath[256];
+                    if (sc->shell_peer[0])
+                        snprintf(rpath, sizeof(rpath), "/%s/shell/functions/read", sc->shell_peer);
+                    else
+                        snprintf(rpath, sizeof(rpath), "/shell/functions/read");
+
+                    portal_msg_t *rm = portal_msg_alloc();
+                    portal_resp_t *rr = portal_resp_alloc();
+                    if (rm && rr) {
+                        portal_msg_set_path(rm, rpath);
+                        portal_msg_set_method(rm, PORTAL_METHOD_CALL);
+                        portal_msg_add_header(rm, "session", sc->shell_session);
+                        g_core->send(g_core, rm, rr);
+                        if (rr->body && rr->body_len > 0)
+                            write(fd, rr->body, rr->body_len);
+                        portal_msg_free(rm); portal_resp_free(rr);
+                    }
+                } else {
+                    char err[128];
+                    snprintf(err, sizeof(err), "Failed to open shell: %s\n",
+                             or_resp->body ? (char *)or_resp->body : "no response");
+                    send_str(fd, err);
+                }
+                portal_msg_free(om); portal_resp_free(or_resp);
+            }
         }
     } else if (strcmp(line, "quit") == 0 || strcmp(line, "exit") == 0) {
         send_str(fd, "Goodbye.\n");
