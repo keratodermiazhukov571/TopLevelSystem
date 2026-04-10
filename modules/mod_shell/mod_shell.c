@@ -319,18 +319,19 @@ static int handle_read(portal_core_t *core, const portal_msg_t *msg,
     /* Check if child is still alive */
     int wstatus;
     if (waitpid(s->child_pid, &wstatus, WNOHANG) > 0) {
-        /* Child exited */
+        /* Child exited — drain remaining output and close */
         char buf[SHELL_READ_BUF];
         ssize_t n = read(s->master_fd, buf, sizeof(buf) - 1);
+        session_close(s);
         if (n > 0) {
             buf[n] = '\0';
             portal_resp_set_status(resp, PORTAL_OK);
             portal_resp_set_body(resp, buf, (size_t)n);
         } else {
-            portal_resp_set_status(resp, PORTAL_OK);
-            portal_resp_set_body(resp, "(session ended)\n", 16);
+            /* Return 404 so the CLI timer auto-disconnects */
+            portal_resp_set_status(resp, PORTAL_NOT_FOUND);
+            portal_resp_set_body(resp, "session ended\n", 14);
         }
-        session_close(s);
         return 0;
     }
 

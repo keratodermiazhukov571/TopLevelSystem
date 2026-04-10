@@ -916,6 +916,20 @@ static void shell_timer_cb(void *userdata)
             portal_msg_add_header(rm, "session", c->shell_session);
             cli_attach_auth(c->fd, rm);
             g_core->send(g_core, rm, rr);
+
+            /* Session died (exit, killed, expired) → auto-disconnect */
+            if (rr->status == PORTAL_NOT_FOUND) {
+                portal_msg_free(rm);
+                portal_resp_free(rr);
+                c->shell_active = 0;
+                c->shell_peer[0] = '\0';
+                c->shell_session[0] = '\0';
+                write(c->fd, "\r\n", 2);
+                send_str(c->fd, "Session ended\n");
+                send_prompt(c->fd);
+                continue;
+            }
+
             /* Write raw bytes to client fd — ANSI escapes pass through */
             if (rr->body && rr->body_len > 0)
                 write(c->fd, rr->body, rr->body_len);
