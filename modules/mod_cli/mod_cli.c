@@ -116,98 +116,156 @@ static void remove_client(int fd)
 
 /* --- Command handlers --- */
 
+/* ── help <module>: dynamic path discovery for any module ── */
+
+struct help_module_ctx {
+    int fd;
+    const char *module;
+    char resources[32][256];
+    char functions[32][256];
+    int res_count;
+    int fn_count;
+};
+
+static void help_module_path_cb(const char *path, const char *module_name, void *ud)
+{
+    struct help_module_ctx *ctx = (struct help_module_ctx *)ud;
+    if (strcmp(module_name, ctx->module) != 0) return;
+
+    /* Classify as resource or function based on path convention */
+    if (ctx->res_count < 32 && strstr(path, "/resources/"))
+        snprintf(ctx->resources[ctx->res_count++], 256, "%s", path);
+    else if (ctx->fn_count < 32 && strstr(path, "/functions/"))
+        snprintf(ctx->functions[ctx->fn_count++], 256, "%s", path);
+    else if (ctx->res_count < 32)
+        snprintf(ctx->resources[ctx->res_count++], 256, "%s", path);
+}
+
+static void cmd_help_module(int fd, const char *module)
+{
+    struct help_module_ctx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.fd = fd;
+    ctx.module = module;
+
+    /* Enumerate all paths belonging to this module */
+    g_core->path_iter(g_core, help_module_path_cb, &ctx);
+
+    if (ctx.res_count == 0 && ctx.fn_count == 0) {
+        char buf[128];
+        snprintf(buf, sizeof(buf),
+                 "Module '%s' not found or has no registered paths.\n"
+                 "Type 'module list' to see loaded modules.\n", module);
+        send_str(fd, buf);
+        return;
+    }
+
+    char buf[4096];
+    int pos = 0;
+    pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos,
+                    "\n  %s — registered paths:\n\n", module);
+
+    if (ctx.res_count > 0) {
+        pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos,
+                        "  Resources (read with 'get'):\n");
+        for (int i = 0; i < ctx.res_count; i++)
+            pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos,
+                            "    get %s\n", ctx.resources[i]);
+        pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos, "\n");
+    }
+
+    if (ctx.fn_count > 0) {
+        pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos,
+                        "  Functions (call with 'get <path>?param=value'):\n");
+        for (int i = 0; i < ctx.fn_count; i++)
+            pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos,
+                            "    get %s\n", ctx.functions[i]);
+        pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos, "\n");
+    }
+
+    pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos,
+                    "  Explore: ls /%s\n\n", module);
+
+    send_str(fd, buf);
+}
+
+/* ── help: compact, grouped, discoverable ── */
+
+struct help_modules_ctx {
+    char names[128][64];
+    int count;
+};
+
+static void help_list_modules_cb(const char *name, const char *version,
+                                  int loaded, uint64_t msg_count,
+                                  uint64_t last_msg_us, void *ud)
+{
+    (void)version; (void)msg_count; (void)last_msg_us;
+    struct help_modules_ctx *ctx = (struct help_modules_ctx *)ud;
+    if (!loaded || ctx->count >= 128) return;
+    /* Skip core infrastructure modules from the help list */
+    if (strcmp(name, "cli") == 0 || strcmp(name, "config_sqlite") == 0 ||
+        strcmp(name, "config_psql") == 0 || strcmp(name, "web") == 0 ||
+        strcmp(name, "ssh") == 0)
+        return;
+    snprintf(ctx->names[ctx->count++], 64, "%s", name);
+}
+
 static void cmd_help(int fd)
 {
     send_str(fd,
-        "Available commands:\n"
-        "  help                  Show this help\n"
-        "  status                Core status\n"
-        "  pwd                   Print current path\n"
-        "  cd <path>             Change current path\n"
-        "  ls [path]             List paths (current or specified)\n"
-        "  module list           List loaded modules\n"
-        "  module load <name>    Load a module\n"
-        "  module unload <name>  Unload a module\n"
-        "  module reload <name>  Reload a module\n"
-        "  login <user> [pass]   Log in\n"
-        "  logout                Log out\n"
-        "  whoami                Show current user and labels\n"
-        "  get <path>            Send GET to any path\n"
-        "  events                List all available events\n"
-        "  subscribe <event>     Subscribe to an event\n"
-        "  unsubscribe <event>   Unsubscribe from event\n"
-        "  subscriptions         Show my subscriptions\n"
-        "  key                   Show my API key\n"
-        "  key rotate            Generate new API key\n"
-        "  passwd <newpass>      Change own password\n"
-        "  cache set <k> <v> [ttl] Set a cache key\n"
-        "  cache get <key>       Get a cache value\n"
-        "  cache del <key>       Delete a cache key\n"
-        "  cache keys            List all keys\n"
-        "  cache status          Cache stats\n"
-        "  cache flush           Clear all cache\n"
-        "  cron add <n> <s> <p>  Schedule job (name, seconds, path)\n"
-        "  cron remove <name>    Remove a job\n"
-        "  cron trigger <name>   Run a job now\n"
-        "  cron jobs             List scheduled jobs\n"
-        "  health                Health status of all modules\n"
-        "  uptime                Show uptime\n"
-        "  json <path>           Get any path as JSON\n"
-        "  curl <url>            HTTP GET an external URL\n"
-        "  kv set <k> <v>       Set a persistent key\n"
-        "  kv get <key>          Get a persistent key\n"
-        "  kv del <key>          Delete a persistent key\n"
-        "  kv keys               List all keys\n"
-        "  firewall deny <src>   Block a source\n"
-        "  firewall allow <src>  Allow a source\n"
-        "  firewall check <src>  Check if source is blocked\n"
-        "  firewall rules        Show all rules\n"
-        "  backup create [name]  Create a backup\n"
-        "  backup list           List backups\n"
-        "  dns resolve <host>    Resolve hostname\n"
-        "  dns reverse <ip>      Reverse DNS lookup\n"
-        "  schedule <n> <s> <p>  Schedule one-shot task (name, delay_secs, path)\n"
-        "  schedule list         List scheduled tasks\n"
-        "  process exec <cmd>    Execute a system command\n"
-        "  validate email <v>    Validate email address\n"
-        "  validate ip <v>       Validate IP address\n"
-        "  sysinfo               System information\n"
-        "  metrics               System metrics\n"
-        "  compress gzip <data>  Gzip compress data\n"
-        "  compress xz <data>    XZ compress data\n"
-        "  config get <m> <k>    Get module config value\n"
-        "  config set <m> <k> <v> Set module config value\n"
-        "  config list [module]  List module config values\n"
-        "  iot discover <subnet> [brand] Scan network (optional: tapo, shelly, tasmota...)\n"
-        "  iot status [name]     Show IoT device status\n"
-        "  iot devices           List all IoT devices\n"
-        "  iot on <name>         Turn device on\n"
-        "  iot off <name>        Turn device off\n"
-        "  iot toggle <name>     Toggle device\n"
-        "  iot add <n> <ip> [drv] [brand] Add device manually\n"
-        "  iot remove <name>     Remove device\n"
-        "  iot refresh           Query all devices for live state + names\n"
-        "  ping [name|all]       Measure RTT to peer(s)\n"
-        "  tracert <path>        Traceroute to a path through federation\n"
-        "  node peers            Show connected peers with stats\n"
-        "  node status <name>    Detailed peer status\n"
-        "  node ping [name|all]  Alias for ping\n"
-        "  node trace <path>     Alias for tracert\n"
-        "  node location <name>  Set node location (free text)\n"
-        "  node gps <lat,lon>    Set GPS coordinates\n"
-        "  node geolocate        Auto-detect location from public IP\n"
-        "  locks                 Show all active resource locks\n"
-        "  locks <path>          Show locks matching path prefix\n"
-        "  lock <resource>       Acquire exclusive lock on resource\n"
-        "  unlock <resource>     Release lock on resource\n"
-        "  verbose [filter]      Show messages in/out in real-time\n"
-        "  verbose off           Stop message trace\n"
-        "  debug [filter]        Like verbose + hex/text dump of body\n"
-        "  debug off             Stop debug trace\n"
-        "  top                   Real-time process viewer (q=quit c/m/p=sort t=threads)\n"
-        "  path list             List all registered paths\n"
-        "  version               Show version\n"
-        "  quit                  Close connection\n"
+        "\n"
+        "  Navigate\n"
+        "    ls [path]           List paths at current or given location\n"
+        "    cd <path>           Change directory (get resolves relative paths)\n"
+        "    get <path>          Read any resource or call any function\n"
+        "    pwd                 Show current path\n"
+        "\n"
+        "  Quick\n"
+        "    status              Core status          health    Module health\n"
+        "    sysinfo             System info           metrics   CPU/mem/disk\n"
+        "    uptime              Uptime                version   Portal version\n"
+        "    top                 Live process viewer   events    List events\n"
+        "\n"
+        "  Session\n"
+        "    login <user> [pass]   Log in             logout    Log out\n"
+        "    whoami                Show identity       passwd    Change password\n"
+        "    key / key rotate      API key management\n"
+        "\n"
+        "  Modules\n"
+        "    module list/load/unload/reload            Manage modules\n"
+        "    config get/set/list <mod> <key> [val]     Module configuration\n"
+        "\n"
+        "  Debug\n"
+        "    verbose [filter]    Trace messages        debug [filter]  + body dump\n"
+        "    locks [path]        Resource locks        path list       All paths\n"
+        "\n"
+    );
+
+    /* Dynamic module list */
+    struct help_modules_ctx mctx;
+    memset(&mctx, 0, sizeof(mctx));
+    g_core->module_iter(g_core, help_list_modules_cb, &mctx);
+
+    if (mctx.count > 0) {
+        char buf[2048];
+        int pos = 0;
+        pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos,
+                        "  Loaded modules — type 'help <name>' for paths:\n    ");
+        for (int i = 0; i < mctx.count; i++) {
+            if (i > 0 && i % 8 == 0)
+                pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos, "\n    ");
+            pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos,
+                            "%-14s", mctx.names[i]);
+        }
+        pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos, "\n\n");
+        send_str(fd, buf);
+    }
+
+    send_str(fd,
+        "  Tip: Tab to autocomplete · get works with cd (relative paths)\n"
+        "       help <module> shows all paths · ls / to browse everything\n"
+        "\n"
     );
 }
 
@@ -660,6 +718,10 @@ static void handle_command(int fd, char *line)
 
     if (strcmp(line, "help") == 0 || strcmp(line, "?") == 0) {
         cmd_help(fd);
+    } else if (strncmp(line, "help ", 5) == 0) {
+        const char *mod = line + 5;
+        while (*mod == ' ') mod++;
+        cmd_help_module(fd, mod);
     } else if (strcmp(line, "status") == 0) {
         cmd_status(fd);
     } else if (strcmp(line, "version") == 0) {
@@ -710,7 +772,19 @@ static void handle_command(int fd, char *line)
         cmd_path_list(fd);
     } else if (strncmp(line, "get ", 4) == 0) {
         const char *target = line + 4;
-        cmd_core_get(fd, target);
+        while (*target == ' ') target++;
+        if (*target == '/') {
+            cmd_core_get(fd, target);
+        } else {
+            /* Resolve relative path using cwd */
+            cli_client_t *gc = find_client(fd);
+            char resolved[PORTAL_MAX_PATH_LEN * 2];
+            if (gc && strcmp(gc->cwd, "/") != 0)
+                snprintf(resolved, sizeof(resolved), "%s/%s", gc->cwd, target);
+            else
+                snprintf(resolved, sizeof(resolved), "/%s", target);
+            cmd_core_get(fd, resolved);
+        }
     } else if (strcmp(line, "storage") == 0) {
         cmd_core_get(fd, "/core/storage");
     } else if (strcmp(line, "events") == 0) {
@@ -1720,9 +1794,20 @@ static void handle_command(int fd, char *line)
         remove_client(fd);
         return;
     } else {
-        char buf[256];
-        snprintf(buf, sizeof(buf), "Unknown command: %s\nType 'help' for commands.\n", line);
-        send_str(fd, buf);
+        /* Try treating the unknown command as a path: get /<line> */
+        if (line[0] != '/' && strchr(line, ' ') == NULL && strlen(line) > 1) {
+            /* Could be a module name — suggest help */
+            char buf[256];
+            snprintf(buf, sizeof(buf),
+                     "Unknown command: %s\n"
+                     "Try: get /%s  ·  help %s  ·  ls /%s\n", line, line, line, line);
+            send_str(fd, buf);
+        } else {
+            char buf[256];
+            snprintf(buf, sizeof(buf),
+                     "Unknown command: %s\nType 'help' for commands, Tab to autocomplete.\n", line);
+            send_str(fd, buf);
+        }
     }
 
     send_prompt(fd);
@@ -1928,7 +2013,7 @@ static void editor_tab_complete(int fd, cli_client_t *c)
                         if (common > wlen)
                             for (size_t ci = wlen; ci < common && ed->len < CLI_MAX_LINE - 2; ci++)
                                 editor_insert_char(fd, c, matches[0][ci]);
-                        if (ed->tab_count >= 2 || common <= wlen) {
+                        if (ed->tab_count >= 1 || common <= wlen) {
                             write(fd, "\r\n", 2);
                             for (int mi = 0; mi < match_count; mi++) {
                                 char mb[140];
@@ -1989,7 +2074,7 @@ static void editor_tab_complete(int fd, cli_client_t *c)
                         if (common > wlen)
                             for (size_t ci = wlen; ci < common && ed->len < CLI_MAX_LINE - 2; ci++)
                                 editor_insert_char(fd, c, matches[0][ci]);
-                        if (ed->tab_count >= 2 || common <= wlen) {
+                        if (ed->tab_count >= 1 || common <= wlen) {
                             write(fd, "\r\n", 2);
                             for (int mi = 0; mi < match_count; mi++) {
                                 char mb[140];
@@ -2065,7 +2150,7 @@ static void editor_tab_complete(int fd, cli_client_t *c)
                     if (common > wlen)
                         for (size_t ci = wlen; ci < common && ed->len < CLI_MAX_LINE - 2; ci++)
                             editor_insert_char(fd, c, matches[0][ci]);
-                    if (ed->tab_count >= 2 || common <= wlen) {
+                    if (ed->tab_count >= 1 || common <= wlen) {
                         write(fd, "\r\n", 2);
                         for (int mi = 0; mi < match_count; mi++) {
                             char mb[140];
@@ -2120,7 +2205,7 @@ static void editor_tab_complete(int fd, cli_client_t *c)
                 for (size_t i = wlen; i < common && ed->len < CLI_MAX_LINE - 2; i++)
                     editor_insert_char(fd, c, matches[0][i]);
             }
-            if (ed->tab_count >= 2 || common <= wlen) {
+            if (ed->tab_count >= 1 || common <= wlen) {
                 /* Show all options */
                 write(fd, "\r\n", 2);
                 for (int i = 0; i < match_count; i++) {
@@ -2276,7 +2361,7 @@ parse_results:
                 editor_insert_char(fd, c, matches[0][i]);
         }
 
-        if (ed->tab_count >= 2) {
+        if (ed->tab_count >= 1) {
             /* Double tab — show all options */
             write(fd, "\r\n", 2);
             for (int i = 0; i < match_count; i++) {
