@@ -858,6 +858,73 @@ static void top_timer_cb(void *userdata)
     }
 }
 
+/* ── Shell mode: exit (close PTY, restore CLI prompt) ── */
+
+static void cmd_shell_exit(cli_client_t *c)
+{
+    if (!c) return;
+
+    /* Close remote PTY session */
+    if (c->shell_session[0]) {
+        char spath[256];
+        if (c->shell_peer[0])
+            snprintf(spath, sizeof(spath), "/%s/shell/functions/close", c->shell_peer);
+        else
+            snprintf(spath, sizeof(spath), "/shell/functions/close");
+
+        portal_msg_t *cm = portal_msg_alloc();
+        portal_resp_t *cr = portal_resp_alloc();
+        if (cm && cr) {
+            portal_msg_set_path(cm, spath);
+            portal_msg_set_method(cm, PORTAL_METHOD_CALL);
+            portal_msg_add_header(cm, "session", c->shell_session);
+            cli_attach_auth(c->fd, cm);
+            g_core->send(g_core, cm, cr);
+            portal_msg_free(cm); portal_resp_free(cr);
+        }
+    }
+
+    c->shell_active = 0;
+    c->shell_peer[0] = '\0';
+    c->shell_session[0] = '\0';
+    write(c->fd, "\r\n", 2);
+    send_str(c->fd, "Disconnected\n");
+    send_prompt(c->fd);
+}
+
+/* ── Shell mode: 10Hz timer reads PTY output and streams to client ── */
+
+static void shell_timer_cb(void *userdata)
+{
+    (void)userdata;
+    for (int i = 0; i < CLI_MAX_CLIENTS; i++) {
+        cli_client_t *c = &g_clients[i];
+        if (!c->active || !c->shell_active || !c->shell_session[0]) continue;
+
+        /* Read available output from remote PTY */
+        char spath[256];
+        if (c->shell_peer[0])
+            snprintf(spath, sizeof(spath), "/%s/shell/functions/read", c->shell_peer);
+        else
+            snprintf(spath, sizeof(spath), "/shell/functions/read");
+
+        portal_msg_t *rm = portal_msg_alloc();
+        portal_resp_t *rr = portal_resp_alloc();
+        if (rm && rr) {
+            portal_msg_set_path(rm, spath);
+            portal_msg_set_method(rm, PORTAL_METHOD_CALL);
+            portal_msg_add_header(rm, "session", c->shell_session);
+            cli_attach_auth(c->fd, rm);
+            g_core->send(g_core, rm, rr);
+            /* Write raw bytes to client fd — ANSI escapes pass through */
+            if (rr->body && rr->body_len > 0)
+                write(c->fd, rr->body, rr->body_len);
+            portal_msg_free(rm);
+            portal_resp_free(rr);
+        }
+    }
+}
+
 /* --- Command dispatch --- */
 
 static void handle_command(int fd, char *line)
@@ -872,79 +939,8 @@ static void handle_command(int fd, char *line)
         return;
     }
 
-    /* ── Shell PTY mode: intercept all input, send to PTY session ── */
-    cli_client_t *sh = find_client(fd);
-    if (sh && sh->shell_active) {
-        if (strcmp(line, "exit") == 0) {
-            /* Close PTY session */
-            char spath[256];
-            if (sh->shell_peer[0])
-                snprintf(spath, sizeof(spath), "/%s/shell/functions/close", sh->shell_peer);
-            else
-                snprintf(spath, sizeof(spath), "/shell/functions/close");
-
-            portal_msg_t *cm = portal_msg_alloc();
-            portal_resp_t *cr = portal_resp_alloc();
-            if (cm && cr) {
-                portal_msg_set_path(cm, spath);
-                portal_msg_set_method(cm, PORTAL_METHOD_CALL);
-                portal_msg_add_header(cm, "session", sh->shell_session);
-                cli_attach_auth(fd, cm);
-                g_core->send(g_core, cm, cr);
-                portal_msg_free(cm); portal_resp_free(cr);
-            }
-            sh->shell_active = 0;
-            sh->shell_peer[0] = '\0';
-            sh->shell_session[0] = '\0';
-            send_str(fd, "Disconnected\n");
-            send_prompt(fd);
-            return;
-        }
-
-        /* Write input + newline to PTY */
-        char spath[256];
-        if (sh->shell_peer[0])
-            snprintf(spath, sizeof(spath), "/%s/shell/functions/write", sh->shell_peer);
-        else
-            snprintf(spath, sizeof(spath), "/shell/functions/write");
-
-        /* Send the command + newline as raw bytes to the PTY */
-        char input[4096];
-        int ilen = snprintf(input, sizeof(input), "%s\n", line);
-
-        portal_msg_t *wm = portal_msg_alloc();
-        portal_resp_t *wr = portal_resp_alloc();
-        if (wm && wr) {
-            portal_msg_set_path(wm, spath);
-            portal_msg_set_method(wm, PORTAL_METHOD_CALL);
-            portal_msg_add_header(wm, "session", sh->shell_session);
-            portal_msg_set_body(wm, input, (size_t)ilen);
-            cli_attach_auth(fd, wm);
-            g_core->send(g_core, wm, wr);
-            portal_msg_free(wm); portal_resp_free(wr);
-        }
-
-        /* Read output from PTY */
-        if (sh->shell_peer[0])
-            snprintf(spath, sizeof(spath), "/%s/shell/functions/read", sh->shell_peer);
-        else
-            snprintf(spath, sizeof(spath), "/shell/functions/read");
-
-        portal_msg_t *rm = portal_msg_alloc();
-        portal_resp_t *rr = portal_resp_alloc();
-        if (rm && rr) {
-            portal_msg_set_path(rm, spath);
-            portal_msg_set_method(rm, PORTAL_METHOD_CALL);
-            portal_msg_add_header(rm, "session", sh->shell_session);
-            cli_attach_auth(fd, rm);
-            g_core->send(g_core, rm, rr);
-            if (rr->body && rr->body_len > 0)
-                write(fd, rr->body, rr->body_len);
-            portal_msg_free(rm); portal_resp_free(rr);
-        }
-        /* No explicit prompt — the PTY shell provides its own prompt */
-        return;
-    }
+    /* Shell mode is now handled in editor_feed() at byte level (raw PTY proxy).
+     * No line-by-line handler needed — every keystroke goes directly to PTY. */
 
     if (strcmp(line, "help") == 0 || strcmp(line, "?") == 0) {
         cmd_help(fd);
@@ -2069,28 +2065,10 @@ static void handle_command(int fd, char *line)
                     char banner[256];
                     const char *host = sc->shell_peer[0] ? sc->shell_peer : "local";
                     snprintf(banner, sizeof(banner),
-                             "PTY session %s on %s (type 'exit' to return)\n", sid, host);
+                             "Connected to %s (Ctrl-] to disconnect)\n", host);
                     send_str(fd, banner);
 
-                    /* Read initial shell output (prompt, motd, etc.) */
-                    char rpath[256];
-                    if (sc->shell_peer[0])
-                        snprintf(rpath, sizeof(rpath), "/%s/shell/functions/read", sc->shell_peer);
-                    else
-                        snprintf(rpath, sizeof(rpath), "/shell/functions/read");
-
-                    portal_msg_t *rm = portal_msg_alloc();
-                    portal_resp_t *rr = portal_resp_alloc();
-                    if (rm && rr) {
-                        portal_msg_set_path(rm, rpath);
-                        portal_msg_set_method(rm, PORTAL_METHOD_CALL);
-                        portal_msg_add_header(rm, "session", sc->shell_session);
-                        cli_attach_auth(fd, rm);
-                        g_core->send(g_core, rm, rr);
-                        if (rr->body && rr->body_len > 0)
-                            write(fd, rr->body, rr->body_len);
-                        portal_msg_free(rm); portal_resp_free(rr);
-                    }
+                    /* Initial output picked up by shell_timer_cb within 100ms */
                 } else {
                     char err[128];
                     snprintf(err, sizeof(err), "Failed to open shell: %s\n",
@@ -2691,6 +2669,34 @@ static void editor_feed(int fd, cli_client_t *c, unsigned char ch)
 {
     cli_line_editor_t *ed = &c->editor;
 
+    /* Shell PTY mode: every byte goes raw to the remote PTY */
+    if (c->shell_active) {
+        if (ch == 0x1D) {  /* Ctrl-] = disconnect (like telnet) */
+            cmd_shell_exit(c);
+            return;
+        }
+        /* Send raw byte to remote PTY — no local processing */
+        char spath[256];
+        if (c->shell_peer[0])
+            snprintf(spath, sizeof(spath), "/%s/shell/functions/write", c->shell_peer);
+        else
+            snprintf(spath, sizeof(spath), "/shell/functions/write");
+
+        portal_msg_t *wm = portal_msg_alloc();
+        portal_resp_t *wr = portal_resp_alloc();
+        if (wm && wr) {
+            portal_msg_set_path(wm, spath);
+            portal_msg_set_method(wm, PORTAL_METHOD_CALL);
+            portal_msg_add_header(wm, "session", c->shell_session);
+            char byte[1] = { (char)ch };
+            portal_msg_set_body(wm, byte, 1);
+            cli_attach_auth(fd, wm);
+            g_core->send(g_core, wm, wr);
+            portal_msg_free(wm); portal_resp_free(wr);
+        }
+        return;  /* raw passthrough — no local line editing */
+    }
+
     /* Interactive `top` intercepts all keys while active */
     if (c->top_active) {
         switch (ch) {
@@ -2892,6 +2898,7 @@ int portal_module_load(portal_core_t *core)
 
     /* 1 Hz timer for interactive `top` view (renders active clients only) */
     core->timer_add(core, 1.0, top_timer_cb, NULL);
+    core->timer_add(core, 0.1, shell_timer_cb, NULL);  /* 10Hz for PTY streaming */
 
     /* Register our path */
     core->path_register(core, "/cli/command", "cli");

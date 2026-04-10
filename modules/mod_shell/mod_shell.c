@@ -235,7 +235,7 @@ static int handle_open(portal_core_t *core, const portal_msg_t *msg,
     if (s->child_pid == 0) {
         /* Child: exec shell */
         setenv("TERM", "xterm-256color", 1);
-        setenv("LANG", "en_US.UTF-8", 1);
+        /* Inherit locale from the system — don't force a specific one */
         execl(g_cfg.shell, g_cfg.shell, "-l", (char *)NULL);
         _exit(127);
     }
