@@ -88,6 +88,7 @@ int portal_module_load(portal_core_t *core)
     /* Register paths — all admin paths served as HTML */
     core->path_register(core, "/admin/dashboard", "admin");
     core->path_set_access(core, "/admin/dashboard", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/admin/dashboard", "Web admin dashboard (single-page HTML app)");
     core->path_register(core, "/admin/*", "admin");
     core->path_set_access(core, "/admin/*", PORTAL_ACCESS_READ);
 

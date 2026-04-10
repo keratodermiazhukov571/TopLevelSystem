@@ -214,8 +214,10 @@ int portal_module_load(portal_core_t *core)
 
     core->path_register(core, "/logic_c/resources/status", "logic_c");
     core->path_set_access(core, "/logic_c/resources/status", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/logic_c/resources/status", "C engine: compiled apps in logic directory");
     core->path_register(core, "/logic_c/functions/compile", "logic_c");
     core->path_set_access(core, "/logic_c/functions/compile", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/logic_c/functions/compile", "Compile C source to shared library. Header: name");
     core->path_register(core, "/logic_c/functions/reload", "logic_c");
     core->path_set_access(core, "/logic_c/functions/reload", PORTAL_ACCESS_RW);
 

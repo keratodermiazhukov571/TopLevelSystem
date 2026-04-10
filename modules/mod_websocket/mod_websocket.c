@@ -274,8 +274,10 @@ int portal_module_load(portal_core_t *core)
 
     core->path_register(core, "/ws/resources/status", "websocket");
     core->path_set_access(core, "/ws/resources/status", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/ws/resources/status", "WebSocket server: port, connected clients");
     core->path_register(core, "/ws/functions/broadcast", "websocket");
     core->path_set_access(core, "/ws/functions/broadcast", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/ws/functions/broadcast", "Broadcast to all WebSocket clients. Body: message");
 
     core->log(core, PORTAL_LOG_INFO, "ws",
               "WebSocket server on port %d", g_port);

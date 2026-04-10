@@ -236,12 +236,16 @@ int portal_module_load(portal_core_t *core)
 
     core->path_register(core, "/gateway/resources/status", "api_gateway");
     core->path_set_access(core, "/gateway/resources/status", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/gateway/resources/status", "API gateway: route count, cache TTL, timeout");
     core->path_register(core, "/gateway/resources/routes", "api_gateway");
     core->path_set_access(core, "/gateway/resources/routes", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/gateway/resources/routes", "List gateway routes with cache hit stats");
     core->path_register(core, "/gateway/functions/add", "api_gateway");
     core->path_set_access(core, "/gateway/functions/add", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/gateway/functions/add", "Add route. Headers: path, target, optional: ttl");
     core->path_register(core, "/gateway/functions/remove", "api_gateway");
     core->path_set_access(core, "/gateway/functions/remove", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/gateway/functions/remove", "Remove route. Header: path");
     core->path_register(core, "/gateway/functions/call", "api_gateway");
     core->path_set_access(core, "/gateway/functions/call", PORTAL_ACCESS_RW);
 

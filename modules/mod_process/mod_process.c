@@ -512,6 +512,7 @@ int portal_module_load(portal_core_t *core)
     core->path_set_access(core, "/process/resources/allowed", PORTAL_ACCESS_READ);
     core->path_register(core, "/process/resources/list", "process");
     core->path_set_access(core, "/process/resources/list", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/process/resources/list", "List running system processes");
     core->path_register(core, "/process/resources/top", "process");
     core->path_set_access(core, "/process/resources/top", PORTAL_ACCESS_READ);
     core->path_register(core, "/process/resources/threads", "process");

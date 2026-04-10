@@ -205,10 +205,13 @@ int portal_module_load(portal_core_t *core)
 
     core->path_register(core, "/httpc/resources/status", "http_client");
     core->path_set_access(core, "/httpc/resources/status", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/httpc/resources/status", "HTTP client: timeout, total requests");
     core->path_register(core, "/httpc/functions/get", "http_client");
     core->path_set_access(core, "/httpc/functions/get", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/httpc/functions/get", "HTTP GET external URL. Header: url");
     core->path_register(core, "/httpc/functions/post", "http_client");
     core->path_set_access(core, "/httpc/functions/post", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/httpc/functions/post", "HTTP POST external URL. Header: url. Body: payload");
 
     core->log(core, PORTAL_LOG_INFO, "httpc",
               "HTTP client ready (timeout: %ds)", g_timeout);

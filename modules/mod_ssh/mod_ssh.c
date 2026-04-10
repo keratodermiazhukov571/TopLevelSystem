@@ -344,6 +344,7 @@ int portal_module_load(portal_core_t *core)
 
     core->path_register(core, "/ssh/resources/status", "ssh");
     core->path_set_access(core, "/ssh/resources/status", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/ssh/resources/status", "SSH server: port, connected sessions");
 
     core->log(core, PORTAL_LOG_INFO, "ssh",
               "SSH server listening on port %d", g_port);

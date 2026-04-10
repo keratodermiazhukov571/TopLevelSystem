@@ -198,6 +198,7 @@ int portal_module_load(portal_core_t *core)
 
     core->path_register(core, "/logic_pascal/resources/status", "logic_pascal");
     core->path_set_access(core, "/logic_pascal/resources/status", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/logic_pascal/resources/status", "Free Pascal engine: compiled apps");
     core->path_register(core, "/logic_pascal/functions/reload", "logic_pascal");
     core->path_set_access(core, "/logic_pascal/functions/reload", PORTAL_ACCESS_RW);
 

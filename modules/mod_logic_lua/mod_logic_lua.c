@@ -429,6 +429,7 @@ int portal_module_load(portal_core_t *core)
     /* Register paths */
     core->path_register(core, "/logic_lua/resources/status", "logic_lua");
     core->path_set_access(core, "/logic_lua/resources/status", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/logic_lua/resources/status", "Lua 5.4 engine: version, loaded scripts, routes");
     core->path_register(core, "/logic_lua/functions/execute", "logic_lua");
     core->path_set_access(core, "/logic_lua/functions/execute", PORTAL_ACCESS_RW);
     core->path_register(core, "/logic_lua/functions/eval", "logic_lua");

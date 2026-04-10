@@ -378,6 +378,7 @@ int portal_module_load(portal_core_t *core)
 
     core->path_register(core, "/logic_python/resources/status", "logic_python");
     core->path_set_access(core, "/logic_python/resources/status", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/logic_python/resources/status", "Python engine: subprocess pid, routes");
     core->path_register(core, "/logic_python/functions/reload", "logic_python");
     core->path_set_access(core, "/logic_python/functions/reload", PORTAL_ACCESS_RW);
 

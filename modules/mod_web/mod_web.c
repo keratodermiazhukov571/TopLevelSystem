@@ -666,6 +666,7 @@ int portal_module_load(portal_core_t *core)
     /* Register paths */
     core->path_register(core, "/web/resources/status", "web");
     core->path_set_access(core, "/web/resources/status", PORTAL_ACCESS_READ);
+    core->path_set_description(core, "/web/resources/status", "HTTP/HTTPS server: ports, prefix, connections, TLS status");
 
     core->log(core, PORTAL_LOG_INFO, "web",
               "HTTP API listening on port %d (prefix: %s)",
