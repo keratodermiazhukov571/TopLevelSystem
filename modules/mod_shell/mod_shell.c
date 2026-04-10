@@ -339,9 +339,7 @@ static int handle_read(portal_core_t *core, const portal_msg_t *msg,
     char buf[SHELL_READ_BUF];
     ssize_t total = 0;
 
-    /* Give the command a moment to produce output */
-    usleep(50000); /* 50ms */
-
+    /* Non-blocking read — returns immediately if no data available */
     ssize_t n = read(s->master_fd, buf, sizeof(buf) - 1);
     if (n > 0) {
         total = n;

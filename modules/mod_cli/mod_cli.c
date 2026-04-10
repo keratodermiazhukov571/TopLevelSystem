@@ -12,6 +12,7 @@
 #include <time.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/ioctl.h>
 #include <errno.h>
 #include "ev_config.h"
 #include "ev.h"
@@ -887,7 +888,9 @@ static void cmd_shell_exit(cli_client_t *c)
     c->shell_active = 0;
     c->shell_peer[0] = '\0';
     c->shell_session[0] = '\0';
-    write(c->fd, "\r\n", 2);
+
+    /* Full terminal reset: show cursor + reset attrs + exit alt screen + RIS */
+    write(c->fd, "\033[?25h\033[0m\033[?1049l\033c", 21);
     send_str(c->fd, "Disconnected\n");
     send_prompt(c->fd);
 }
@@ -924,7 +927,7 @@ static void shell_timer_cb(void *userdata)
                 c->shell_active = 0;
                 c->shell_peer[0] = '\0';
                 c->shell_session[0] = '\0';
-                write(c->fd, "\r\n", 2);
+                write(c->fd, "\033[?25h\033[0m\033[?1049l\033c", 21);
                 send_str(c->fd, "Session ended\n");
                 send_prompt(c->fd);
                 continue;
@@ -2061,8 +2064,20 @@ static void handle_command(int fd, char *line)
             if (om && or_resp) {
                 portal_msg_set_path(om, spath);
                 portal_msg_set_method(om, PORTAL_METHOD_CALL);
-                portal_msg_add_header(om, "rows", "24");
-                portal_msg_add_header(om, "cols", "80");
+                /* Detect actual terminal size from client fd */
+                {
+                    struct winsize ws;
+                    char r_str[8], c_str[8];
+                    if (ioctl(fd, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0 && ws.ws_col > 0) {
+                        snprintf(r_str, sizeof(r_str), "%d", ws.ws_row);
+                        snprintf(c_str, sizeof(c_str), "%d", ws.ws_col);
+                    } else {
+                        snprintf(r_str, sizeof(r_str), "24");
+                        snprintf(c_str, sizeof(c_str), "80");
+                    }
+                    portal_msg_add_header(om, "rows", r_str);
+                    portal_msg_add_header(om, "cols", c_str);
+                }
                 cli_attach_auth(fd, om);
                 g_core->send(g_core, om, or_resp);
 
@@ -2707,6 +2722,33 @@ static void editor_feed(int fd, cli_client_t *c, unsigned char ch)
             cli_attach_auth(fd, wm);
             g_core->send(g_core, wm, wr);
             portal_msg_free(wm); portal_resp_free(wr);
+        }
+
+        /* Immediately read response for instant echo (don't wait for timer) */
+        {
+            char rpath[256];
+            if (c->shell_peer[0])
+                snprintf(rpath, sizeof(rpath), "/%s/shell/functions/read", c->shell_peer);
+            else
+                snprintf(rpath, sizeof(rpath), "/shell/functions/read");
+
+            portal_msg_t *rm = portal_msg_alloc();
+            portal_resp_t *rr = portal_resp_alloc();
+            if (rm && rr) {
+                portal_msg_set_path(rm, rpath);
+                portal_msg_set_method(rm, PORTAL_METHOD_CALL);
+                portal_msg_add_header(rm, "session", c->shell_session);
+                cli_attach_auth(fd, rm);
+                g_core->send(g_core, rm, rr);
+                if (rr->status == PORTAL_NOT_FOUND) {
+                    portal_msg_free(rm); portal_resp_free(rr);
+                    cmd_shell_exit(c);
+                    return;
+                }
+                if (rr->body && rr->body_len > 0)
+                    write(fd, rr->body, rr->body_len);
+                portal_msg_free(rm); portal_resp_free(rr);
+            }
         }
         return;  /* raw passthrough — no local line editing */
     }
