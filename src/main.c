@@ -843,6 +843,23 @@ static int create_instance(const char *name)
         "title = Portal Admin\n");
     MOD_CLOSE();
 
+    MOD_CONF("watchdog");
+    fprintf(f,
+        "# mod_watchdog — Hardware watchdog keepalive\n"
+        "#\n"
+        "# device     : Watchdog device path\n"
+        "# interval   : Keepalive write interval in seconds (must be < hardware timeout)\n"
+        "# auto_start : Open device automatically on module load (true/false)\n"
+        "#\n"
+        "# WARNING: Once opened, /dev/watchdog will reboot the system if Portal\n"
+        "#          stops running. Use auto_start=true only on unattended devices.\n"
+        "enabled = false\n\n"
+        "[mod_watchdog]\n"
+        "device     = /dev/watchdog\n"
+        "interval   = 15\n"
+        "auto_start = false\n");
+    MOD_CLOSE();
+
     /* Modules with no config */
     const char *simple_mods[] = {
         "health", "json", "http_client", "metrics", "hello", "myapp",
@@ -1372,6 +1389,21 @@ static int update_instances(void)
                     "bind_dn =\n"
                     "bind_pass =\n"
                     "user_filter = (uid=%%s)\n");
+            } else if (strcmp(mod, "watchdog") == 0) {
+                fprintf(f,
+                    "# mod_watchdog — Hardware watchdog keepalive\n"
+                    "#\n"
+                    "# device     : Watchdog device path\n"
+                    "# interval   : Keepalive write interval in seconds (must be < hardware timeout)\n"
+                    "# auto_start : Open device automatically on module load (true/false)\n"
+                    "#\n"
+                    "# WARNING: Once opened, /dev/watchdog will reboot the system if Portal\n"
+                    "#          stops running. Use auto_start=true only on unattended devices.\n"
+                    "enabled = false\n\n"
+                    "[mod_watchdog]\n"
+                    "device     = /dev/watchdog\n"
+                    "interval   = 15\n"
+                    "auto_start = false\n");
             } else {
                 /* Generic config for simple modules */
                 fprintf(f, "# mod_%s\nenabled = true\n", mod);

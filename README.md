@@ -28,7 +28,7 @@
 
 ```bash
 # Build
-make                        # Compile core + 50 modules + tools
+make                        # Compile core + 51 modules + tools
 make tests                  # Run 57 unit tests
 make install                # Install to /usr/local/bin + /usr/lib/portal
 
@@ -671,6 +671,12 @@ Raw TCP port forwarding through federation connections. Export local services, m
 
 Config: exports and maps persisted to instance `tunnel/` directory.
 
+### mod_watchdog — Hardware Watchdog Keepalive
+
+Opens `/dev/watchdog` and writes a keepalive byte at a configurable interval. If Portal stops, the hardware timer expires and the system reboots — essential for unattended embedded/appliance devices. Exclusive resource locking (Law 14) prevents conflicts. Magic close (`V`) on disable/unload disarms cleanly without reboot.
+
+Config: `device` (path), `interval` (seconds), `auto_start` (true/false). Disabled by default.
+
 ### mod_hello — Hello World Example
 
 Minimal example module demonstrating the 4-export interface. Registers `/hello/resources/greeting`. Template for new module development.
@@ -1210,6 +1216,7 @@ portal/
 │   ├── mod_admin/               Web admin dashboard (HTML)
 │   ├── mod_iot/                 IoT device management (Tapo KLAP, MQTT, GPIO)
 │   ├── mod_tunnel/              Port forwarding through federation
+│   ├── mod_watchdog/            Hardware watchdog keepalive
 │   ├── mod_hello/               Hello world example
 │   └── mod_myapp/               Example app (counter, events, ACL)
 ├── tools/
@@ -1235,7 +1242,7 @@ portal/
 │   └── portal-devtest2.service  Devtest2 systemd service
 ├── portal.conf                  Legacy default config (instances use /etc/portal/<name>/)
 ├── users.conf                   Legacy user file (instances use users/ directory)
-├── Makefile                     Build system (50 modules)
+├── Makefile                     Build system (51 modules)
 └── CLAUDE.md                    Project index
 ```
 

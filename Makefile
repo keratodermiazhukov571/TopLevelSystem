@@ -123,6 +123,7 @@ MOD_ACME     = $(MOD_DIR)/mod_acme.so
 MOD_ADMIN    = $(MOD_DIR)/mod_admin.so
 MOD_IOT      = $(MOD_DIR)/mod_iot.so
 MOD_TUNNEL   = $(MOD_DIR)/mod_tunnel.so
+MOD_WATCHDOG = $(MOD_DIR)/mod_watchdog.so
 TEST_PATH    = $(BUILD_DIR)/test_path
 TEST_ACL     = $(BUILD_DIR)/test_acl
 TEST_HT      = $(BUILD_DIR)/test_hashtable
@@ -164,7 +165,7 @@ MOD_ALL = $(MOD_CLI) $(MOD_NODE) $(MOD_HELLO) $(MOD_SHELL) $(MOD_MYAPP) $(MOD_CA
           $(MOD_GPIO) $(MOD_PROCESS) $(MOD_KV) $(MOD_WEBHOOK) $(MOD_SYSINFO) \
           $(MOD_CRYPTO) $(MOD_LOG) $(MOD_BACKUP) $(MOD_LDAP) $(MOD_VALID) \
           $(MOD_SCHED) $(MOD_GATEWAY) $(MOD_ACME) $(MOD_ADMIN) $(MOD_IOT) \
-          $(MOD_TUNNEL)
+          $(MOD_TUNNEL) $(MOD_WATCHDOG)
 
 ifeq ($(HAS_SQLITE),yes)
 MOD_ALL += $(MOD_SQLITE)
@@ -400,6 +401,10 @@ $(MOD_IOT): $(MOD_DIR)/mod_iot/mod_iot.c $(CORE_DIR)/core_message.c
 $(MOD_TUNNEL): $(MOD_DIR)/mod_tunnel/mod_tunnel.c $(CORE_DIR)/core_message.c
 	@echo "  SO    $@"
 	@$(CC) $(CFLAGS) -pthread -shared -fPIC -o $@ $^
+
+$(MOD_WATCHDOG): $(MOD_DIR)/mod_watchdog/mod_watchdog.c $(CORE_DIR)/core_message.c
+	@echo "  SO    $@"
+	@$(CC) $(CFLAGS) -shared -fPIC -o $@ $^
 
 # --- Tools ---
 
