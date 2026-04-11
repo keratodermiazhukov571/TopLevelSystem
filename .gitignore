@@ -19,7 +19,6 @@
 build/
 *.so
 *.o
-config.mk
 
 # Runtime files
 *.pid
@@ -27,10 +26,10 @@ config.mk
 *.db
 *.db-shm
 *.db-wal
-*.log
-*.tmp
-/tmp/
 
-# IDE / tools
-.claude/
+# Temporary
+*.tmp
+*.log
+/tmp/
+config.mk
 .claude/projects/

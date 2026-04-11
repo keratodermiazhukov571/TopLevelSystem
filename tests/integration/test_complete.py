@@ -16,6 +16,7 @@
 # along with this program; if not, see <https://www.gnu.org/licenses/>.
 #
 
+#!/usr/bin/env python3
 """
 Portal v1.0.0 — Complete Functional Test Suite
 

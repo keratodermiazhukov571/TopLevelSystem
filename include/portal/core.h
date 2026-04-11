@@ -109,6 +109,21 @@ struct portal_core {
     int         (*resource_locked)(portal_core_t *core, const char *resource);
     const char *(*resource_owner)(portal_core_t *core, const char *resource);
 
+    /* ABI NOTE: new function pointers go HERE, just before _internal, so
+     * existing modules compiled against an older core.h keep working —
+     * their field offsets stay the same as long as nothing is inserted
+     * above this line. */
+
+    /* Change the event mask on an already-registered fd without churn.
+     * Use to toggle EV_READ ↔ EV_WRITE as TX buffers fill and drain. */
+    int  (*fd_modify)(portal_core_t *core, int fd, uint32_t events);
+
+    /* Return the raw libev loop pointer (as void *) so modules can drive
+     * it re-entrantly. Used by sync-over-async wrappers that need to
+     * pump events while waiting for a response (e.g., mod_node peer_send_wait).
+     * Cast to (struct ev_loop *) to use with ev_run. */
+    void *(*ev_loop_get)(portal_core_t *core);
+
     /* Opaque internal state — modules must not touch */
     void *_internal;
 };

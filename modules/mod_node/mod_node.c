@@ -3,7 +3,9 @@
  *
  * Connects Portal instances into a distributed network.
  * Remote paths transparently accessible as /node_name/path.
- * Wire protocol (PORTAL02) over TCP/TLS with thread pool per peer.
+ * Wire protocol (PORTAL02) over TCP/TLS. Single-threaded, fully async:
+ * all TCP/TLS/PORTAL02 handshakes + peer I/O drive through libev in
+ * the core event loop. See Commits 4-7 of the scale-out refactor.
  *
  * Features:
  *   - TLS encryption (OpenSSL, optional, self-signed or CA certs)
@@ -37,6 +39,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -44,6 +47,8 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <time.h>
+
+#include "../../src/core/core_hashtable.h"
 
 #ifdef HAS_SSL
 #include <openssl/ssl.h>
@@ -60,14 +65,13 @@ extern int     portal_wire_encode_resp(const portal_resp_t *resp, uint8_t **buf,
 extern int     portal_wire_decode_resp(const uint8_t *buf, size_t len, portal_resp_t *resp);
 extern int32_t portal_wire_read_length(const uint8_t *buf);
 
-#define NODE_MAX_PEERS        2048
+#define NODE_MAX_PEERS        16384  /* sanity cap; peers are heap-allocated individually */
 #define NODE_MAX_THREADS      16
 #define NODE_BUF_SIZE         65536
 #define NODE_DEFAULT_PORT     9700
 #define NODE_DEFAULT_THREADS  4
 #define NODE_HANDSHAKE_MAGIC  "PORTAL02"
 #define NODE_RECONNECT_SEC    10
-#define NODE_MAX_FDS          8192
 #define NODE_PEER_MAX_PATHS   32      /* paths registered per remote peer (was 256) */
 #define NODE_PEER_PATH_LEN    256     /* max path length per peer (was 1024) */
 #define NODE_KEY_HASH_LEN     32   /* SHA-256 hash of federation key */
@@ -97,16 +101,18 @@ static int      g_tls_enabled = 0;
 static char     g_cert_file[PORTAL_MAX_PATH_LEN] = "";
 static char     g_key_file[PORTAL_MAX_PATH_LEN] = "";
 static int      g_tls_verify = 0;
-static SSL     *g_fd_ssl[NODE_MAX_FDS]; /* fd → SSL* lookup */
 #endif
 
-/* --- Thread pool for outbound requests --- */
+/* --- Persistent worker connections (NOT threads) ---
+ *
+ * A worker is one TCP/TLS connection to a peer. Since Commit 4d, all
+ * outbound traffic goes through peer_send_wait() which round-robins
+ * across workers and correlates responses via a per-fd FIFO. There is
+ * no separate pthread per worker — the event loop drives everything. */
 
 typedef struct {
-    int            fd;          /* persistent TCP connection */
+    int            fd;          /* persistent TCP connection, -1 if dead */
     int            busy;        /* 1 = processing a request, 2 = pipe mode */
-    pthread_t      thread;
-    int            running;
 #ifdef HAS_SSL
     SSL           *ssl;
 #endif
@@ -140,6 +146,12 @@ typedef struct {
     uint64_t       bytes_recv;
     uint64_t       errors;
     time_t         connected_at;
+
+    /* Commit 6: exponential backoff state for outbound reconnect. Reset
+     * to 0/0 when the peer reaches READY. reconnect_dead_peers skips this
+     * peer until now_us() >= next_retry_us. */
+    int            retry_count;
+    uint64_t       next_retry_us;
 } node_peer_t;
 
 typedef struct {
@@ -158,8 +170,571 @@ static int             g_threads_per_peer = NODE_DEFAULT_THREADS;
 static char            g_node_name[PORTAL_MAX_MODULE_NAME] = "local";
 static char            g_location[256] = "";
 static char            g_gps[64] = "";       /* "lat,lon" */
-static node_peer_t     g_peers[NODE_MAX_PEERS];
+/* Dynamic peer registry. Each peer is a separate heap allocation so pointers
+ * returned by find_peer_* stay valid across growth of the pointer array.
+ * g_peers_cap starts small and doubles on demand up to NODE_MAX_PEERS. */
+static node_peer_t   **g_peers = NULL;
+static int             g_peers_cap = 0;
 static int             g_peer_count = 0;
+
+/* Ensure the pointer array has room for at least `min_cap` entries.
+ * Returns 0 on success, -1 on allocation failure. */
+static int peers_ensure_capacity(int min_cap)
+{
+    if (g_peers_cap >= min_cap) return 0;
+    int new_cap = g_peers_cap ? g_peers_cap : 64;
+    while (new_cap < min_cap) new_cap *= 2;
+    if (new_cap > NODE_MAX_PEERS) new_cap = NODE_MAX_PEERS;
+    if (new_cap < min_cap) return -1;  /* hit hard cap */
+
+    node_peer_t **nw = realloc(g_peers, (size_t)new_cap * sizeof(node_peer_t *));
+    if (!nw) return -1;
+    /* zero the new tail */
+    for (int i = g_peers_cap; i < new_cap; i++) nw[i] = NULL;
+    g_peers = nw;
+    g_peers_cap = new_cap;
+    return 0;
+}
+
+/* Allocate a new peer slot and return its index. Caller fills the fields.
+ * Returns -1 if the hard cap is reached. */
+static int peers_append(void)
+{
+    if (g_peer_count >= NODE_MAX_PEERS) return -1;
+    if (peers_ensure_capacity(g_peer_count + 1) < 0) return -1;
+
+    node_peer_t *p = calloc(1, sizeof(node_peer_t));
+    if (!p) return -1;
+    g_peers[g_peer_count] = p;
+    return g_peer_count++;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  Per-fd incremental read state (Commit 3: incremental inbound reader)
+ *
+ *  Each peer fd registered in the event loop carries an rx_state_t as
+ *  libev userdata. The state accumulates bytes across multiple EV_READ
+ *  wake-ups so we never block the loop waiting for a partial frame to
+ *  complete. The fd must be non-blocking (set via set_nonblocking()).
+ *
+ *  Lifetime: allocated by node_fd_add_with_rx(), freed by
+ *  node_fd_del_with_rx(). Tracked in g_rx_by_fd hashtable so the del-side
+ *  can find it (core's fd_del doesn't give us the userdata back).
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Forward declaration — pending_req_t is defined below; rx_state_t
+ * holds pointers to it as head/tail of the per-fd FIFO queue. */
+struct pending_req;
+
+typedef struct {
+    /* ── rx side (Commit 3: incremental reader) ── */
+    uint8_t *buf;        /* allocated read buffer */
+    size_t   cap;        /* allocated capacity */
+    size_t   len;        /* bytes currently in buf */
+    size_t   need;       /* total bytes expected for current frame (0 = not parsed) */
+
+    /* ── tx side (Commit 4b: dormant until Commit 4c wires it in) ── */
+    uint8_t *tx_buf;     /* queued outbound wire bytes */
+    size_t   tx_cap;     /* allocated capacity of tx_buf */
+    size_t   tx_len;     /* bytes currently queued */
+    size_t   tx_off;     /* bytes already sent from tx_buf */
+
+    /* Currently-registered libev event mask (EV_READ, or EV_READ|EV_WRITE
+     * when tx_buf has data to flush). Used by fd_state_ensure_writable() /
+     * fd_state_stop_writable() to avoid redundant fd_modify calls. */
+    uint32_t events;
+
+    /* fd this state belongs to. Cached for helpers that need it when only
+     * the state pointer is in hand (e.g., on_writable, pending_wait). */
+    int      fd;
+
+    /* Per-fd FIFO of outstanding outbound requests. Responses from the peer
+     * match the head of this queue (TCP order guarantee). Fields managed
+     * by Commit 4d's peer_send_wait / pending_wait — dormant until then. */
+    struct pending_req *pending_head;
+    struct pending_req *pending_tail;
+    int      pending_count;
+
+    /* ── Commit 5: async handshake state machine ──
+     * Most fds are CONN_STATE_READY (normal traffic). Inbound fds in the
+     * middle of the TLS + PORTAL02 handshake are in a transient state and
+     * carry an hs_context_t with the scratch data needed to finish. */
+    int      conn_state;       /* conn_state_t, default READY */
+    uint64_t state_enter_us;   /* when we entered the current state */
+    struct hs_context *hs;     /* handshake scratch; NULL for READY conns */
+
+    /* ── Commit 7b: SSL* stored per-fd ──
+     * Replaces the old g_fd_ssl[8192] static array. Direct pointer access,
+     * no bounds check, no cap — rx_state_t is already in hand on every
+     * hot path (it's the libev userdata). For peer worker fds the same
+     * SSL* is also cached in peer->workers[i].ssl so cleanup paths that
+     * only have the fd can resolve it via ssl_for_fd(). */
+#ifdef HAS_SSL
+    SSL     *ssl;
+#endif
+} rx_state_t;
+
+/* Connection lifecycle states. Default for fds created via node_fd_add_with_rx
+ * is READY (back-compat with Commits 3/4). Fds created via
+ * node_fd_add_inbound_handshake start in TLS_ACCEPT. Commit 6 will add
+ * TLS_CONNECT for the outbound side. */
+typedef enum {
+    CONN_STATE_READY = 0,       /* normal traffic (default) */
+    CONN_STATE_TCP_CONNECTING,  /* outbound non-blocking connect() in flight */
+    CONN_STATE_TLS_ACCEPT,      /* inbound SSL_do_handshake in flight */
+    CONN_STATE_TLS_CONNECT,     /* outbound SSL_do_handshake in flight */
+    CONN_STATE_HS_EXCHANGE,     /* sending + receiving PORTAL02 handshake */
+    CONN_STATE_DEAD             /* cleanup pending */
+} conn_state_t;
+
+/* Scratch data for an in-progress handshake. Allocated only for transient
+ * conns, freed by rx_free when the fd is cleaned up. Kept separate from
+ * the ~160-byte fd_state_t to avoid bloating every steady-state conn. */
+typedef struct hs_context {
+    struct sockaddr_in peer_addr;   /* for logging and peer registration */
+
+    /* Commit 6: outbound side needs a backref to the peer this fd is
+     * building. Inbound leaves these NULL/0; for inbound, finalize_handshake
+     * creates or looks up the peer by name from the received handshake bytes. */
+    node_peer_t *peer;              /* NULL for inbound; set for outbound */
+    int      is_outbound;           /* 1 = outbound, 0 = inbound */
+    int      slot_hint;             /* for outbound: which workers[] slot to fill */
+
+    /* Decoded peer info (filled by drive_hs_recv as bytes arrive) */
+    char     peer_name[PORTAL_MAX_MODULE_NAME];
+
+    /* Advertised peer list — populated incrementally. Using a dynamic
+     * list avoids the 1 MB stack blowup the old synchronous path had. */
+    char   **advertised;
+    int      adv_count;
+    int      adv_cap;
+
+    /* Recv parse state */
+    int      recv_phase;    /* 0 hdr, 1 name, 2 count, 3 pn_len, 4 pn, 5 done */
+    uint16_t name_len;      /* filled at phase 1 */
+    uint16_t peer_count;    /* filled at phase 2 */
+    uint16_t next_pn_len;   /* filled at phase 3, consumed at phase 4 */
+
+    /* Send state */
+    int      send_queued;   /* 1 = PORTAL02 bytes already appended to tx_buf */
+    int      send_done;     /* 1 = tx_buf fully drained */
+    int      recv_done;     /* 1 = PORTAL02 handshake fully parsed */
+} hs_context_t;
+
+/* A single outstanding outbound request waiting for its response.
+ *
+ * Lifetime (when Commit 4d wires this up):
+ *   1. Caller allocates on the stack or heap, fills ->resp and ->deadline_us.
+ *   2. peer_send_wait pushes it to the tail of some fd's pending FIFO,
+ *      appends the wire bytes to that fd's tx_buf, and calls pending_wait.
+ *   3. pending_wait runs a nested ev_run(loop, EVRUN_ONCE) loop until
+ *      ->done becomes 1 (set by on_inbound_data when it matches a response)
+ *      or the deadline fires (pending_wait sets ->done and ->rc = -1).
+ *   4. Caller reads ->rc and frees (if heap-allocated).
+ *
+ * No pthread mutex/cv — everything is single-threaded (core thread).
+ */
+typedef struct pending_req {
+    uint64_t             deadline_us;  /* absolute deadline (now_us() + timeout) */
+    int                  done;         /* 1 = response received or timeout/error */
+    int                  rc;           /* 0 = ok, -1 = error/timeout */
+    portal_resp_t       *resp;         /* caller-provided response destination */
+    struct pending_req  *next;         /* FIFO linkage inside rx_state_t */
+} pending_req_t;
+
+/* Forward declarations for Commit 4b helpers defined below node_read_nb.
+ * rx_free() references fd_state_fail_pending() to walk the FIFO when a
+ * conn dies — the helper lives in the Commit 4b block further down. */
+static void fd_state_fail_pending(rx_state_t *st);
+
+/* Forward declarations for functions defined further down in the file
+ * that are referenced by the Commit 4b helpers block (which is placed
+ * after node_read_nb, itself before these functions are defined). */
+static void mark_peer_dead_by_fd(int fd);
+static uint64_t now_us(void);
+static void register_indirect_peer(const char *name, int hub_idx);
+
+static portal_ht_t g_rx_by_fd;      /* fd (as decimal string) → rx_state_t* */
+static int         g_rx_ht_inited = 0;
+
+static void rx_key(int fd, char *buf, size_t buflen)
+{
+    snprintf(buf, buflen, "%d", fd);
+}
+
+static rx_state_t *rx_alloc(int fd)
+{
+    rx_state_t *rx = calloc(1, sizeof(rx_state_t));
+    if (rx) {
+        rx->fd = fd;
+        rx->events = EV_READ;   /* default; tx-path enables EV_WRITE lazily */
+    }
+    return rx;
+}
+
+static void hs_context_free(hs_context_t *hs)
+{
+    if (!hs) return;
+    for (int i = 0; i < hs->adv_count; i++) free(hs->advertised[i]);
+    free(hs->advertised);
+    free(hs);
+}
+
+static void rx_free(rx_state_t *rx)
+{
+    if (!rx) return;
+    /* Fail any pending waiters before freeing the state — Commit 4d
+     * relies on this invariant so dying peers wake all their callers. */
+    fd_state_fail_pending(rx);
+    /* Commit 5: free transient handshake scratch and the SSL if we
+     * own it (i.e., the handshake died before finalize_handshake
+     * transferred ownership to a node_peer_t). Commit 7b: ssl lives
+     * on rx now, so we just free rx->ssl directly. */
+#ifdef HAS_SSL
+    if (rx->conn_state != CONN_STATE_READY && rx->ssl) {
+        SSL_free(rx->ssl);
+        rx->ssl = NULL;
+    }
+#endif
+    hs_context_free(rx->hs);
+    free(rx->buf);
+    free(rx->tx_buf);
+    free(rx);
+}
+
+/* Reset rx_state_t for the next frame. Keeps the buffer allocated for
+ * reuse; zeroes the lengths. */
+static void rx_reset(rx_state_t *rx)
+{
+    rx->len = 0;
+    rx->need = 0;
+}
+
+/* Set an fd to non-blocking mode. Must be called on every peer fd that is
+ * registered in the event loop so the incremental reader can return to
+ * libev between partial reads instead of blocking. */
+static int set_nonblocking(int fd)
+{
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) return -1;
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+/* Restore blocking mode. Used by worker_send_recv while the fd is
+ * temporarily out of the event loop (via get_worker's fd_del). */
+static int set_blocking(int fd)
+{
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) return -1;
+    return fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+}
+
+/* Forward declaration — on_inbound_data is defined much later */
+static void on_inbound_data(int fd, uint32_t events, void *userdata);
+
+/* Register an fd in the event loop with per-fd rx_state passed as userdata.
+ * Creates a fresh rx_state_t, stores it in g_rx_by_fd, and calls fd_add. */
+static int node_fd_add_with_rx(int fd)
+{
+    if (!g_rx_ht_inited) {
+        portal_ht_init(&g_rx_by_fd, 256);
+        g_rx_ht_inited = 1;
+    }
+    rx_state_t *rx = rx_alloc(fd);
+    if (!rx) return -1;
+
+    char key[16];
+    rx_key(fd, key, sizeof(key));
+    /* If a stale entry exists (shouldn't happen, but defend), free it */
+    rx_state_t *old = portal_ht_get(&g_rx_by_fd, key);
+    if (old) {
+        rx_free(old);
+        portal_ht_del(&g_rx_by_fd, key);
+    }
+    portal_ht_set(&g_rx_by_fd, key, rx);
+
+    if (g_core->fd_add(g_core, fd, EV_READ, on_inbound_data, rx) < 0) {
+        portal_ht_del(&g_rx_by_fd, key);
+        rx_free(rx);
+        return -1;
+    }
+    return 0;
+}
+
+/* Remove an fd from the event loop and free its rx_state. Safe to call on
+ * fds that were registered without rx_state (the hashtable lookup returns
+ * NULL and only fd_del is performed). */
+static void node_fd_del_with_rx(int fd)
+{
+    if (g_rx_ht_inited) {
+        char key[16];
+        rx_key(fd, key, sizeof(key));
+        rx_state_t *rx = portal_ht_get(&g_rx_by_fd, key);
+        if (rx) {
+            portal_ht_del(&g_rx_by_fd, key);
+            rx_free(rx);
+        }
+    }
+    g_core->fd_del(g_core, fd);
+}
+
+/* Non-blocking read that distinguishes would-block from hard error.
+ * Returns:
+ *    > 0    bytes read
+ *    0      EOF (peer closed)
+ *   -1      hard error (mark dead)
+ *   -2      would block (retry on next event) */
+static ssize_t node_read_nb(int fd, void *ssl_ptr, void *buf, size_t len)
+{
+#ifdef HAS_SSL
+    SSL *ssl = (SSL *)ssl_ptr;
+    if (ssl) {
+        int n = SSL_read(ssl, buf, (int)len);
+        if (n > 0) return n;
+        int err = SSL_get_error(ssl, n);
+        if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
+            return -2;
+        if (err == SSL_ERROR_ZERO_RETURN) return 0;   /* clean close */
+        return -1;
+    }
+#else
+    (void)ssl_ptr;
+#endif
+    ssize_t n = read(fd, buf, len);
+    if (n > 0) return n;
+    if (n == 0) return 0;   /* EOF */
+    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return -2;
+    return -1;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  Outbound tx path + sync-over-async wait (Commits 4b/4c/4d, now active)
+ *
+ *  node_write_nb     — non-blocking SSL/plain write
+ *  on_writable       — drains fd_state_t->tx_buf when libev fires EV_WRITE
+ *  pending_wait      — nested ev_run(EVRUN_ONCE) until done or timeout
+ *  peer_send_wait    — full round-trip wrapper for outbound /peer/... route
+ *
+ *  All of these are now wired into the hot path:
+ *    - Commit 4c: inbound response send uses fd_state_tx_append + on_writable
+ *    - Commit 4d: /peer/... route uses peer_send_wait + FIFO correlation
+ *    - Commit 5/6: TLS handshake drive loop shares the same tx_buf infra
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Non-blocking write — mirrors node_read_nb return convention:
+ *    > 0    bytes written
+ *    0      peer closed (hard error treated same as -1)
+ *   -1      hard error (mark peer dead)
+ *   -2      would block (retry on next EV_WRITE event) */
+static ssize_t node_write_nb(int fd, void *ssl_ptr, const void *buf, size_t len)
+{
+#ifdef HAS_SSL
+    SSL *ssl = (SSL *)ssl_ptr;
+    if (ssl) {
+        int n = SSL_write(ssl, buf, (int)len);
+        if (n > 0) return n;
+        int err = SSL_get_error(ssl, n);
+        if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
+            return -2;
+        return -1;
+    }
+#else
+    (void)ssl_ptr;
+#endif
+    ssize_t n = write(fd, buf, len);
+    if (n > 0) return n;
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
+        return -2;
+    return -1;
+}
+
+/* Walk the FIFO pending queue and mark every entry as failed. Used by
+ * rx_free (when a conn dies) so all in-flight callers get PORTAL_UNAVAILABLE
+ * on their nested ev_run wakeup. Forward-declared above rx_free. */
+static void fd_state_fail_pending(rx_state_t *st)
+{
+    pending_req_t *pr = st->pending_head;
+    while (pr) {
+        pending_req_t *next = pr->next;
+        if (pr->resp) pr->resp->status = PORTAL_UNAVAILABLE;
+        pr->rc = -1;
+        pr->done = 1;
+        pr = next;
+    }
+    st->pending_head = st->pending_tail = NULL;
+    st->pending_count = 0;
+}
+
+/* Append wire bytes to the fd's tx_buf, growing the buffer as needed.
+ * The actual socket write happens in on_writable(). Returns 0 on success,
+ * -1 on allocation failure. */
+static int fd_state_tx_append(rx_state_t *st, const void *data, size_t len)
+{
+    if (st->tx_len + len > st->tx_cap) {
+        size_t ncap = st->tx_cap ? st->tx_cap : 4096;
+        while (ncap < st->tx_len + len) ncap *= 2;
+        uint8_t *nb = realloc(st->tx_buf, ncap);
+        if (!nb) return -1;
+        st->tx_buf = nb;
+        st->tx_cap = ncap;
+    }
+    memcpy(st->tx_buf + st->tx_len, data, len);
+    st->tx_len += len;
+    return 0;
+}
+
+/* Ensure EV_WRITE is registered on this fd so on_writable fires when the
+ * kernel can accept more data. Idempotent — skips the fd_modify call if
+ * the fd already has EV_WRITE set. */
+static void fd_state_ensure_writable(rx_state_t *st)
+{
+    if (!(st->events & EV_WRITE)) {
+        st->events |= EV_WRITE;
+        g_core->fd_modify(g_core, st->fd, st->events);
+    }
+}
+
+/* Drop EV_WRITE from the fd's event mask once tx_buf is fully drained.
+ * Keeps EV_READ active. */
+static void fd_state_stop_writable(rx_state_t *st)
+{
+    if (st->events & EV_WRITE) {
+        st->events = EV_READ;
+        g_core->fd_modify(g_core, st->fd, st->events);
+    }
+}
+
+/* Drain as much of tx_buf as possible without blocking. When the buffer
+ * is empty, drop EV_WRITE. On hard error, mark the peer dead and fail all
+ * pending waiters. Called by Commit 4c's on_inbound_data when libev
+ * delivers EV_WRITE on the fd. */
+static void on_writable(rx_state_t *st)
+{
+    if (!st || st->tx_len == 0) {
+        if (st) fd_state_stop_writable(st);
+        return;
+    }
+#ifdef HAS_SSL
+    void *ssl = st->ssl;
+#else
+    void *ssl = NULL;
+#endif
+    while (st->tx_off < st->tx_len) {
+        ssize_t n = node_write_nb(st->fd, ssl,
+                                    st->tx_buf + st->tx_off,
+                                    st->tx_len - st->tx_off);
+        if (n > 0) {
+            st->tx_off += (size_t)n;
+        } else if (n == -2) {
+            return;   /* would block — retry on next EV_WRITE */
+        } else {
+            mark_peer_dead_by_fd(st->fd);
+            fd_state_fail_pending(st);
+            return;
+        }
+    }
+    /* Fully drained */
+    st->tx_off = 0;
+    st->tx_len = 0;
+    fd_state_stop_writable(st);
+}
+
+/* Block the caller on a nested ev_run until pr->done becomes 1 or the
+ * deadline fires. On timeout, unlinks pr from its owning FIFO and sets
+ * rc = -1. libev supports re-entrant ev_run, so nested calls stack
+ * safely as long as each level eventually completes or times out. */
+static void pending_wait(rx_state_t *st, pending_req_t *pr)
+{
+    struct ev_loop *loop = (struct ev_loop *)g_core->ev_loop_get(g_core);
+    while (!pr->done) {
+        uint64_t now = now_us();
+        if (now >= pr->deadline_us) {
+            /* Unlink pr from the FIFO if still present */
+            pending_req_t **link = &st->pending_head;
+            while (*link && *link != pr) link = &(*link)->next;
+            if (*link) {
+                *link = pr->next;
+                if (st->pending_tail == pr) {
+                    st->pending_tail = st->pending_head;
+                    while (st->pending_tail && st->pending_tail->next)
+                        st->pending_tail = st->pending_tail->next;
+                }
+                st->pending_count--;
+            }
+            if (pr->resp) pr->resp->status = PORTAL_UNAVAILABLE;
+            pr->rc = -1;
+            pr->done = 1;
+            break;
+        }
+        ev_run(loop, EVRUN_ONCE);
+    }
+}
+
+/* Submit an outbound portal_msg_t to one of peer's worker fds and block
+ * re-entrantly until a response arrives or timeout_us elapses. Returns
+ * 0 on success (resp filled), -1 on error.
+ *
+ * Replaces the Commit-3 get_worker + worker_send_recv + release_worker
+ * synchronous blocking path. No fd_del/fd_add churn. The core thread
+ * pumps libev via pending_wait while the response is in flight. */
+static int peer_send_wait(node_peer_t *peer, const portal_msg_t *msg,
+                           portal_resp_t *resp, uint64_t timeout_us)
+{
+    if (!peer || !peer->ready || peer->dead || peer->worker_count == 0)
+        return -1;
+
+    /* Round-robin pick a worker fd whose fd_state is registered */
+    rx_state_t *st = NULL;
+    int picked_idx = -1;
+    for (int attempt = 0; attempt < peer->worker_count; attempt++) {
+        int idx = (peer->next_worker + attempt) % peer->worker_count;
+        if (peer->workers[idx].fd < 0) continue;
+        if (peer->workers[idx].busy == 2) continue;   /* pipe mode */
+        char key[16];
+        rx_key(peer->workers[idx].fd, key, sizeof(key));
+        rx_state_t *cand = portal_ht_get(&g_rx_by_fd, key);
+        if (cand) {
+            st = cand;
+            picked_idx = idx;
+            break;
+        }
+    }
+    if (!st) return -1;
+    peer->next_worker = (picked_idx + 1) % peer->worker_count;
+
+    /* Encode message into wire bytes */
+    uint8_t *wire = NULL;
+    size_t wire_len = 0;
+    if (portal_wire_encode_msg(msg, &wire, &wire_len) < 0)
+        return -1;
+
+    /* Append to tx_buf and enable EV_WRITE */
+    if (fd_state_tx_append(st, wire, wire_len) < 0) {
+        free(wire);
+        return -1;
+    }
+    free(wire);
+    fd_state_ensure_writable(st);
+
+    /* Push a pending_req on the FIFO tail */
+    pending_req_t *pr = calloc(1, sizeof(*pr));
+    if (!pr) return -1;
+    pr->resp = resp;
+    pr->deadline_us = now_us() + timeout_us;
+    pr->done = 0;
+    pr->rc = -1;
+    if (st->pending_tail) st->pending_tail->next = pr;
+    else st->pending_head = pr;
+    st->pending_tail = pr;
+    st->pending_count++;
+
+    /* Block on nested ev_run until done */
+    pending_wait(st, pr);
+
+    int rc = pr->rc;
+    free(pr);
+    return rc;
+}
 
 static portal_module_info_t mod_info = {
     .name        = "node",
@@ -265,67 +840,49 @@ static ssize_t node_read_partial(int fd, void *ssl_ptr, void *buf, size_t len)
  * ================================================================ */
 
 #ifdef HAS_SSL
-static void fd_ssl_set(int fd, SSL *ssl)
-{
-    if (fd >= 0 && fd < NODE_MAX_FDS)
-        g_fd_ssl[fd] = ssl;
-}
+/* Commit 7b: fd_ssl_get/set/clear + g_fd_ssl[NODE_MAX_FDS] removed.
+ * SSL* now lives on rx_state_t->ssl (per-fd state). The only fds that
+ * carry SSL are those with a live rx_state_t in g_rx_by_fd, so the
+ * static array was pure overhead — bounds check on every access plus
+ * 64 KB of zero'd memory at module load. */
 
-static SSL *fd_ssl_get(int fd)
+/* Helper: look up the SSL* for an fd when only the fd is in hand (e.g.
+ * peer cleanup paths that don't have the rx pointer). Prefers peer
+ * workers[].ssl / ctrl_ssl (the stable peer-level cache); falls back
+ * to g_rx_by_fd only during the transient handshake window. */
+static SSL *ssl_for_fd(int fd)
 {
-    if (fd >= 0 && fd < NODE_MAX_FDS)
-        return g_fd_ssl[fd];
+    if (fd < 0) return NULL;
+    for (int i = 0; i < g_peer_count; i++) {
+        node_peer_t *p = g_peers[i];
+        if (p->ctrl_fd == fd && p->ctrl_ssl) return p->ctrl_ssl;
+        for (int j = 0; j < p->worker_count; j++)
+            if (p->workers[j].fd == fd && p->workers[j].ssl)
+                return p->workers[j].ssl;
+    }
+    if (g_rx_ht_inited) {
+        char key[16]; rx_key(fd, key, sizeof(key));
+        rx_state_t *rx = portal_ht_get(&g_rx_by_fd, key);
+        if (rx) return rx->ssl;
+    }
     return NULL;
 }
 
-static void fd_ssl_clear(int fd)
-{
-    if (fd >= 0 && fd < NODE_MAX_FDS)
-        g_fd_ssl[fd] = NULL;
-}
-
-static SSL *node_tls_connect(int fd)
-{
-    if (!g_tls_enabled || !g_ssl_client_ctx) return NULL;
-    SSL *ssl = SSL_new(g_ssl_client_ctx);
-    if (!ssl) return NULL;
-    SSL_set_fd(ssl, fd);
-    if (SSL_connect(ssl) <= 0) {
-        if (g_core)
-            g_core->log(g_core, PORTAL_LOG_WARN, "node",
-                        "TLS connect failed on fd %d", fd);
-        SSL_free(ssl);
-        return NULL;
-    }
-    fd_ssl_set(fd, ssl);
-    return ssl;
-}
-
-static SSL *node_tls_accept(int fd)
-{
-    if (!g_tls_enabled || !g_ssl_server_ctx) return NULL;
-    SSL *ssl = SSL_new(g_ssl_server_ctx);
-    if (!ssl) return NULL;
-    SSL_set_fd(ssl, fd);
-    if (SSL_accept(ssl) <= 0) {
-        if (g_core)
-            g_core->log(g_core, PORTAL_LOG_WARN, "node",
-                        "TLS accept failed on fd %d", fd);
-        SSL_free(ssl);
-        return NULL;
-    }
-    fd_ssl_set(fd, ssl);
-    return ssl;
-}
+/* Commit 7: node_tls_connect / node_tls_accept removed. The async
+ * drive_tls state machine (Commit 5/6) replaces both: SSL is created
+ * in-place with SSL_set_{connect,accept}_state and driven by
+ * SSL_do_handshake with WANT_READ/WANT_WRITE, never blocking. */
 
 static void node_ssl_close(int fd, SSL *ssl)
 {
+    (void)fd;
     if (ssl) {
         /* Skip SSL_shutdown — just free. Shutdown on dead connections
          * can segfault on some OpenSSL versions (1.1.1 on Ubuntu 18.04) */
         SSL_free(ssl);
     }
-    fd_ssl_clear(fd);
+    /* Commit 7b: no more per-fd SSL slot to clear — rx->ssl is freed
+     * inside rx_free when the fd_state_t is reaped. */
 }
 
 static int init_tls_contexts(void)
@@ -399,147 +956,31 @@ static int reload_tls_contexts(void)
 
 /* ================================================================
  * Wire protocol handshake (runs AFTER TLS handshake if enabled)
- * ================================================================ */
-
-/*
+ * ================================================================
+ *
  * Handshake format (PORTAL02):
  *   8 bytes: magic "PORTAL02"
  *  32 bytes: SHA-256 of federation_key (or zeros if no key)
  *   2 bytes: node name length (big-endian)
  *   N bytes: node name
  *   2 bytes: peer count (number of connected peer names)
- *   For each peer:
- *     2 bytes: name length
- *     N bytes: name
- */
-static int send_handshake(int fd, void *ssl)
-{
-    uint8_t buf[4096];
-    uint8_t *p = buf;
-    memcpy(p, NODE_HANDSHAKE_MAGIC, 8); p += 8;
+ *   For each peer: 2 bytes length + N bytes name
+ *
+ * Commit 7: the old blocking send_handshake / recv_handshake helpers are
+ * gone. The async handshake is now driven by drive_hs_send_build +
+ * drive_hs_recv (Commit 5/6) which feed/parse bytes through the event
+ * loop via the per-fd hs_context_t scratch area. */
 
-    /* Federation key hash (32 bytes) */
-    if (g_has_key)
-        memcpy(p, g_key_hash, NODE_KEY_HASH_LEN);
-    else
-        memset(p, 0, NODE_KEY_HASH_LEN);
-    p += NODE_KEY_HASH_LEN;
-
-    /* Node name */
-    uint16_t nlen = (uint16_t)strlen(g_node_name);
-    p[0] = nlen >> 8; p[1] = nlen & 0xff; p += 2;
-    memcpy(p, g_node_name, nlen); p += nlen;
-
-    /* Advertise connected peer names (for hub discovery) */
-    int peer_adv_count = 0;
-    uint8_t *count_pos = p;
-    p += 2;  /* reserve 2 bytes for count */
-    for (int i = 0; i < g_peer_count; i++) {
-        if (!g_peers[i].ready || g_peers[i].is_indirect) continue;
-        uint16_t pnlen = (uint16_t)strlen(g_peers[i].name);
-        if (p + 2 + pnlen > buf + sizeof(buf) - 2) break;
-        p[0] = pnlen >> 8; p[1] = pnlen & 0xff; p += 2;
-        memcpy(p, g_peers[i].name, pnlen); p += pnlen;
-        peer_adv_count++;
-    }
-    count_pos[0] = (uint8_t)(peer_adv_count >> 8);
-    count_pos[1] = (uint8_t)(peer_adv_count & 0xff);
-
-    return node_send(fd, ssl, buf, (size_t)(p - buf));
-}
-
-static int recv_handshake(int fd, void *ssl, char *peer_name, size_t name_size,
-                           char advertised[][PORTAL_MAX_MODULE_NAME], int *adv_count)
-{
-    uint8_t hdr[8 + NODE_KEY_HASH_LEN + 2];  /* magic + key_hash + name_len */
-    if (node_recv(fd, ssl, hdr, sizeof(hdr)) < 0) return -1;
-    if (memcmp(hdr, NODE_HANDSHAKE_MAGIC, 8) != 0) return -1;
-
-    /* Verify federation key */
-    uint8_t *remote_hash = hdr + 8;
-    if (g_has_key) {
-        if (memcmp(remote_hash, g_key_hash, NODE_KEY_HASH_LEN) != 0) {
-            if (g_core)
-                g_core->log(g_core, PORTAL_LOG_WARN, "node",
-                            "Federation key mismatch — rejecting peer");
-            return -2;  /* auth failure */
-        }
-    }
-
-    /* Read node name */
-    uint16_t nlen = ((uint16_t)hdr[8 + NODE_KEY_HASH_LEN] << 8)
-                   | hdr[8 + NODE_KEY_HASH_LEN + 1];
-    if (nlen >= name_size) return -1;
-    if (node_recv(fd, ssl, peer_name, nlen) < 0) return -1;
-    peer_name[nlen] = '\0';
-
-    /* Read advertised peer count + names */
-    uint8_t pc[2];
-    if (node_recv(fd, ssl, pc, 2) < 0) return -1;
-    int count = ((int)pc[0] << 8) | pc[1];
-    if (adv_count) *adv_count = 0;
-
-    for (int i = 0; i < count; i++) {
-        uint8_t pnl[2];
-        if (node_recv(fd, ssl, pnl, 2) < 0) return -1;
-        uint16_t pnlen = ((uint16_t)pnl[0] << 8) | pnl[1];
-        if (pnlen >= PORTAL_MAX_MODULE_NAME) {
-            /* Skip oversized name */
-            char skip[256];
-            node_recv(fd, ssl, skip, pnlen < 256 ? pnlen : 256);
-            continue;
-        }
-        char pname[PORTAL_MAX_MODULE_NAME];
-        if (node_recv(fd, ssl, pname, pnlen) < 0) return -1;
-        pname[pnlen] = '\0';
-
-        /* Store if caller wants it */
-        if (advertised && adv_count && *adv_count < NODE_MAX_PEERS) {
-            snprintf(advertised[*adv_count], PORTAL_MAX_MODULE_NAME, "%s", pname);
-            (*adv_count)++;
-        }
-    }
-
-    return 0;
-}
-
-/* Create a TCP connection to a peer */
-static int create_connection(const char *host, int port)
-{
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
-
-    /* TCP keepalive: prevents NAT table expiry on idle connections */
-    int yes = 1;
-    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
-#ifdef TCP_KEEPIDLE
-    int idle = 60;      /* start keepalive after 60s idle */
-    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
-#endif
-#ifdef TCP_KEEPINTVL
-    int intvl = 30;     /* send keepalive every 30s */
-    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
-#endif
-#ifdef TCP_KEEPCNT
-    int cnt = 3;        /* 3 failed keepalives = dead */
-    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
-#endif
-
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons((uint16_t)port);
-    if (inet_pton(AF_INET, host, &addr.sin_addr) <= 0) { close(fd); return -1; }
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) { close(fd); return -1; }
-    return fd;
-}
+/* Commit 7: create_connection removed. node_fd_add_outbound_handshake
+ * (Commit 6) does socket + non-blocking + keepalive + connect() inline
+ * and drives completion via the event loop. */
 
 /* Forward declarations */
 static void on_inbound_data(int fd, uint32_t events, void *userdata);
 static void mark_peer_dead_by_fd(int fd);
 static void reconnect_dead_peers(void);
 
-/* --- Worker thread pool --- */
+/* --- Peer registry: direct + indirect (hub-proxied) --- */
 
 /* Register an indirect (hub-proxied) peer */
 static void register_indirect_peer(const char *name, int hub_idx)
@@ -547,11 +988,11 @@ static void register_indirect_peer(const char *name, int hub_idx)
     /* Don't register ourselves or already-known peers */
     if (strcmp(name, g_node_name) == 0) return;
     for (int i = 0; i < g_peer_count; i++)
-        if (strcmp(g_peers[i].name, name) == 0) return;
-    if (g_peer_count >= NODE_MAX_PEERS) return;
+        if (strcmp(g_peers[i]->name, name) == 0) return;
 
-    node_peer_t *peer = &g_peers[g_peer_count++];
-    memset(peer, 0, sizeof(*peer));
+    int idx = peers_append();
+    if (idx < 0) return;
+    node_peer_t *peer = g_peers[idx];
     pthread_mutex_init(&peer->lock, NULL);
     snprintf(peer->name, sizeof(peer->name), "%s", name);
     peer->ctrl_fd = -1;
@@ -572,51 +1013,20 @@ static void register_indirect_peer(const char *name, int hub_idx)
         peer->path_count = 1;
         g_core->log(g_core, PORTAL_LOG_INFO, "node",
                     "Indirect peer '%s' via hub '%s'",
-                    name, g_peers[hub_idx].name);
+                    name, g_peers[hub_idx]->name);
     }
 }
 
-static int create_worker_connections(node_peer_t *peer)
-{
-    for (int i = 0; i < peer->worker_count; i++) {
-        if (peer->is_inbound) {
-            peer->workers[i].fd = -1;
-#ifdef HAS_SSL
-            peer->workers[i].ssl = NULL;
-#endif
-        } else {
-            peer->workers[i].fd = create_connection(peer->host, peer->port);
-            if (peer->workers[i].fd >= 0) {
-                void *ssl = NULL;
-#ifdef HAS_SSL
-                if (g_tls_enabled) {
-                    ssl = node_tls_connect(peer->workers[i].fd);
-                    if (!ssl && g_tls_enabled) {
-                        close(peer->workers[i].fd);
-                        peer->workers[i].fd = -1;
-                        continue;
-                    }
-                }
-                peer->workers[i].ssl = ssl;
-#endif
-                send_handshake(peer->workers[i].fd, ssl);
-                char dummy[64];
-                recv_handshake(peer->workers[i].fd, ssl, dummy, sizeof(dummy),
-                               NULL, NULL);
-                g_core->fd_add(g_core, peer->workers[i].fd,
-                               EV_READ, on_inbound_data, NULL);
-            }
-        }
-        peer->workers[i].busy = 0;
-    }
-    return 0;
-}
+/* Commit 7: create_worker_connections removed. connect_to_peer_async
+ * (Commit 6) kicks off N+1 parallel async handshakes — each one
+ * independently drives TCP→TLS→PORTAL02 and attaches to the peer via
+ * finalize_handshake when done. No serial spin-up. */
 
 static node_peer_t *find_peer_by_name(const char *name)
 {
     for (int i = 0; i < g_peer_count; i++)
-        if (strcmp(g_peers[i].name, name) == 0 && g_peers[i].ready)
-            return &g_peers[i];
+        if (strcmp(g_peers[i]->name, name) == 0 && g_peers[i]->ready)
+            return g_peers[i];
     return NULL;
 }
 
@@ -624,7 +1034,7 @@ static node_peer_t *find_peer_by_name(const char *name)
 static node_peer_t *find_peer_by_fd(int fd)
 {
     for (int i = 0; i < g_peer_count; i++) {
-        node_peer_t *p = &g_peers[i];
+        node_peer_t *p = g_peers[i];
         if (p->ctrl_fd == fd) return p;
         for (int j = 0; j < p->worker_count; j++)
             if (p->workers[j].fd == fd) return p;
@@ -636,8 +1046,8 @@ static node_peer_t *find_peer_by_fd(int fd)
 static node_peer_t *find_peer_any(const char *name)
 {
     for (int i = 0; i < g_peer_count; i++)
-        if (strcmp(g_peers[i].name, name) == 0)
-            return &g_peers[i];
+        if (strcmp(g_peers[i]->name, name) == 0)
+            return g_peers[i];
     return NULL;
 }
 
@@ -673,13 +1083,21 @@ static void release_worker(node_peer_t *peer, worker_t *w)
 {
     (void)peer;
     w->busy = 0;
-    g_core->fd_add(g_core, w->fd, EV_READ, on_inbound_data, NULL);
+    /* Restore non-blocking mode before returning to the event loop */
+    set_nonblocking(w->fd);
+    node_fd_add_with_rx(w->fd);
 }
 
 /* Send a message through a worker and read response */
 static int worker_send_recv(worker_t *w, const portal_msg_t *msg,
                              portal_resp_t *resp)
 {
+    /* The fd is non-blocking for the event loop, but worker_send_recv does
+     * synchronous send+recv outside the loop (via get_worker's fd_del).
+     * Temporarily switch to blocking so plain read/SSL_read behave the
+     * old way; release_worker will set it back to non-blocking. */
+    set_blocking(w->fd);
+
     struct timeval tv = {30, 0};
     setsockopt(w->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(w->fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
@@ -795,7 +1213,8 @@ done:
     }
 #endif
     /* Plain TCP pipe: re-add fd to event loop for reuse */
-    g_core->fd_add(g_core, wfd, EV_READ, on_inbound_data, NULL);
+    set_nonblocking(wfd);
+    node_fd_add_with_rx(wfd);
     g_core->log(g_core, PORTAL_LOG_INFO, "node", "Pipe closed on fd %d", wfd);
     free(ctx);
     return NULL;
@@ -816,13 +1235,16 @@ static int start_pipe(int worker_fd, int port)
         return -1;
     }
 
-    g_core->fd_del(g_core, worker_fd);
+    /* Take the worker fd out of the event loop and restore blocking mode
+     * for pipe_relay_thread's synchronous select-based byte relay. */
+    node_fd_del_with_rx(worker_fd);
+    set_blocking(worker_fd);
 
     pipe_ctx_t *ctx = malloc(sizeof(*ctx));
     ctx->worker_fd = worker_fd;
     ctx->service_fd = sfd;
 #ifdef HAS_SSL
-    ctx->worker_ssl = fd_ssl_get(worker_fd);
+    ctx->worker_ssl = ssl_for_fd(worker_fd);
 #endif
 
     pthread_t th;
@@ -834,51 +1256,940 @@ static int start_pipe(int worker_fd, int port)
     return 0;
 }
 
-/* --- Inbound peer handling --- */
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  Commit 5: async inbound handshake state machine
+ *
+ *  The old on_new_peer did SSL_accept + send_handshake + recv_handshake
+ *  all synchronously, freezing the event loop for tens of ms per peer.
+ *  The new path registers each accepted fd in CONN_STATE_TLS_ACCEPT with
+ *  an hs_context_t, and on_inbound_data dispatches to drive_tls() /
+ *  drive_hs_send() / drive_hs_recv() based on the conn state. Each helper
+ *  returns to the loop on WANT_READ/WANT_WRITE/EAGAIN.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Set an fd's conn_state and refresh state_enter_us (for timeout sweep). */
+static void conn_set_state(rx_state_t *rx, conn_state_t new_state)
+{
+    rx->conn_state = new_state;
+    rx->state_enter_us = now_us();
+}
+
+/* Advertise a peer name into the hs_context's dynamic list. */
+static int hs_adv_add(hs_context_t *hs, const char *name)
+{
+    if (hs->adv_count >= hs->adv_cap) {
+        int nc = hs->adv_cap ? hs->adv_cap * 2 : 8;
+        char **nv = realloc(hs->advertised, (size_t)nc * sizeof(char *));
+        if (!nv) return -1;
+        hs->advertised = nv;
+        hs->adv_cap = nc;
+    }
+    hs->advertised[hs->adv_count] = strdup(name);
+    if (!hs->advertised[hs->adv_count]) return -1;
+    hs->adv_count++;
+    return 0;
+}
+
+/* Cleanly close a transient handshake fd: remove from event loop (which
+ * frees the rx_state_t via rx_free, which in turn SSL_frees and closes
+ * the hs_context), then close the fd. */
+static void hs_abort(int fd, const char *reason)
+{
+    /* Commit 6: for outbound handshakes, capture the peer pointer BEFORE
+     * node_fd_del_with_rx frees the fd_state_t, so we can update its
+     * retry backoff state after cleanup. */
+    node_peer_t *outbound_peer = NULL;
+    if (g_rx_ht_inited) {
+        char key[16]; rx_key(fd, key, sizeof(key));
+        rx_state_t *rx = portal_ht_get(&g_rx_by_fd, key);
+        if (rx && rx->hs && rx->hs->is_outbound && rx->hs->peer &&
+            rx->hs->peer->ready == 0) {
+            outbound_peer = rx->hs->peer;
+        }
+    }
+
+    if (g_core)
+        g_core->log(g_core, PORTAL_LOG_WARN, "node",
+                    "Handshake fd=%d aborted: %s", fd, reason);
+    node_fd_del_with_rx(fd);
+    close(fd);
+
+    if (outbound_peer) {
+        /* Only mark dead + back off if no other fd on this peer has
+         * succeeded yet. If ctrl_fd was already set, another parallel
+         * connect already made the peer ready; this is just one worker
+         * that failed. */
+        if (outbound_peer->ctrl_fd < 0) {
+            outbound_peer->dead = 1;
+            outbound_peer->retry_count++;
+            uint64_t backoff[] = {1, 2, 5, 10, 30};
+            int bi = outbound_peer->retry_count - 1;
+            if (bi >= (int)(sizeof(backoff)/sizeof(backoff[0])))
+                bi = (int)(sizeof(backoff)/sizeof(backoff[0])) - 1;
+            outbound_peer->next_retry_us = now_us() + backoff[bi] * 1000000ULL;
+        }
+    }
+}
+
+/* Forward declaration — drive_hs_send_build is called by drive_tls at TLS
+ * completion and defined further below. */
+static void drive_hs_send_build(rx_state_t *rx);
+static void finalize_handshake(rx_state_t *rx);
+
+/* Run one step of the SSL handshake. Works for both accept and connect
+ * sides — SSL_do_handshake retries whatever side was configured at
+ * SSL_new + SSL_set_accept_state/SSL_set_connect_state time. Returns
+ * 1 if handshake done, 0 if more I/O needed, -1 on hard error. */
+#ifdef HAS_SSL
+static int drive_tls(rx_state_t *rx)
+{
+    SSL *ssl = rx->ssl;
+    if (!ssl) return -1;
+
+    int rc = SSL_do_handshake(ssl);
+    if (rc == 1) {
+        /* TLS handshake complete. Move to HS_EXCHANGE and queue our
+         * PORTAL02 handshake bytes into tx_buf. */
+        conn_set_state(rx, CONN_STATE_HS_EXCHANGE);
+        drive_hs_send_build(rx);
+        return 1;
+    }
+
+    int err = SSL_get_error(ssl, rc);
+    if (err == SSL_ERROR_WANT_READ) {
+        /* Default fd_state_t events has EV_READ. Nothing to toggle. */
+        return 0;
+    }
+    if (err == SSL_ERROR_WANT_WRITE) {
+        fd_state_ensure_writable(rx);
+        return 0;
+    }
+    /* Hard error */
+    return -1;
+}
+#endif
+
+/* Build our PORTAL02 handshake bytes and queue them in tx_buf for draining.
+ * Called once at TLS completion. Mirrors the bytes-on-wire format of the
+ * old synchronous send_handshake(). */
+static void drive_hs_send_build(rx_state_t *rx)
+{
+    if (!rx->hs || rx->hs->send_queued) return;
+
+    uint8_t buf[4096];
+    uint8_t *p = buf;
+
+    memcpy(p, NODE_HANDSHAKE_MAGIC, 8); p += 8;
+
+    if (g_has_key)
+        memcpy(p, g_key_hash, NODE_KEY_HASH_LEN);
+    else
+        memset(p, 0, NODE_KEY_HASH_LEN);
+    p += NODE_KEY_HASH_LEN;
+
+    uint16_t nlen = (uint16_t)strlen(g_node_name);
+    p[0] = (uint8_t)(nlen >> 8); p[1] = (uint8_t)(nlen & 0xff); p += 2;
+    memcpy(p, g_node_name, nlen); p += nlen;
+
+    int peer_adv_count = 0;
+    uint8_t *count_pos = p;
+    p += 2;
+    for (int i = 0; i < g_peer_count; i++) {
+        if (!g_peers[i]->ready || g_peers[i]->is_indirect) continue;
+        uint16_t pnlen = (uint16_t)strlen(g_peers[i]->name);
+        if (p + 2 + pnlen > buf + sizeof(buf) - 2) break;
+        p[0] = (uint8_t)(pnlen >> 8); p[1] = (uint8_t)(pnlen & 0xff); p += 2;
+        memcpy(p, g_peers[i]->name, pnlen); p += pnlen;
+        peer_adv_count++;
+    }
+    count_pos[0] = (uint8_t)(peer_adv_count >> 8);
+    count_pos[1] = (uint8_t)(peer_adv_count & 0xff);
+
+    size_t total = (size_t)(p - buf);
+    if (fd_state_tx_append(rx, buf, total) == 0) {
+        fd_state_ensure_writable(rx);
+        rx->hs->send_queued = 1;
+    }
+}
+
+/* Incrementally parse incoming PORTAL02 handshake bytes from rx->buf.
+ * The rx buffer is used as a sliding window: bytes accumulate as libev
+ * delivers them, and each call consumes whatever whole fields have
+ * arrived. Returns: 1 if handshake fully parsed, 0 if more bytes needed,
+ * -1 on protocol error, -2 on auth failure (bad federation key). */
+static int drive_hs_recv(rx_state_t *rx)
+{
+    if (!rx->hs) return -1;
+    hs_context_t *hs = rx->hs;
+
+    /* Phase 0: fixed header (8 magic + 32 key_hash + 2 name_len = 42 bytes) */
+    if (hs->recv_phase == 0) {
+        if (rx->len < 42) return 0;
+        if (memcmp(rx->buf, NODE_HANDSHAKE_MAGIC, 8) != 0) return -1;
+        if (g_has_key) {
+            if (memcmp(rx->buf + 8, g_key_hash, NODE_KEY_HASH_LEN) != 0)
+                return -2;
+        }
+        hs->name_len = ((uint16_t)rx->buf[40] << 8) | rx->buf[41];
+        if (hs->name_len >= PORTAL_MAX_MODULE_NAME) return -1;
+        hs->recv_phase = 1;
+    }
+
+    /* Phase 1: node name (hs->name_len bytes) */
+    if (hs->recv_phase == 1) {
+        size_t needed = (size_t)(42 + hs->name_len);
+        if (rx->len < needed) return 0;
+        memcpy(hs->peer_name, rx->buf + 42, hs->name_len);
+        hs->peer_name[hs->name_len] = '\0';
+        hs->recv_phase = 2;
+    }
+
+    /* Phase 2: 2 bytes advertised peer count */
+    if (hs->recv_phase == 2) {
+        size_t needed = (size_t)(42 + hs->name_len + 2);
+        if (rx->len < needed) return 0;
+        size_t off = (size_t)(42 + hs->name_len);
+        hs->peer_count = ((uint16_t)rx->buf[off] << 8) | rx->buf[off + 1];
+        hs->recv_phase = 3;
+    }
+
+    /* Phases 3 + 4 loop: for each advertised peer, read 2 bytes len + N bytes name */
+    size_t off = (size_t)(42 + hs->name_len + 2);
+    for (int k = 0; k < (int)hs->peer_count; k++) {
+        /* Skip already-consumed entries by walking forward */
+        if (k < hs->adv_count) {
+            /* Advance offset past this entry: we need 2 + name_len of it */
+            uint16_t skip_len;
+            if (rx->len < off + 2) return 0;
+            skip_len = ((uint16_t)rx->buf[off] << 8) | rx->buf[off + 1];
+            off += 2;
+            if (rx->len < off + skip_len) return 0;
+            off += skip_len;
+            continue;
+        }
+        /* Phase 3: read 2-byte length */
+        if (rx->len < off + 2) return 0;
+        hs->next_pn_len = ((uint16_t)rx->buf[off] << 8) | rx->buf[off + 1];
+        off += 2;
+        /* Phase 4: read name bytes */
+        if (rx->len < off + hs->next_pn_len) return 0;
+        if (hs->next_pn_len < PORTAL_MAX_MODULE_NAME) {
+            char tmp[PORTAL_MAX_MODULE_NAME];
+            memcpy(tmp, rx->buf + off, hs->next_pn_len);
+            tmp[hs->next_pn_len] = '\0';
+            hs_adv_add(hs, tmp);
+        }
+        /* else: oversized name, silently skip */
+        off += hs->next_pn_len;
+    }
+
+    /* All peers consumed — handshake parse is complete. */
+    hs->recv_phase = 5;
+    return 1;
+}
+
+/* Called when both send + recv halves of the PORTAL02 handshake are done.
+ * Two paths:
+ *   - Inbound (hs->is_outbound == 0): look up or create the node_peer_t
+ *     by the peer_name received from the wire.
+ *   - Outbound (hs->is_outbound == 1): the node_peer_t is already known
+ *     (hs->peer was set by connect_to_peer_async). Verify the received
+ *     peer_name matches what we expected, then attach the fd. */
+static void finalize_handshake(rx_state_t *rx)
+{
+    if (!rx->hs) return;
+    hs_context_t *hs = rx->hs;
+    int client_fd = rx->fd;
+
+#ifdef HAS_SSL
+    SSL *ssl = rx->ssl;
+#else
+    void *ssl = NULL;
+#endif
+    const char *tls_tag = ssl ? " [TLS]" : "";
+
+    /* ── Outbound path (Commit 6) ─────────────────────────────────── */
+    if (hs->is_outbound && hs->peer) {
+        node_peer_t *peer = hs->peer;
+
+        /* Attach fd to a worker slot. For OUTBOUND peers, ctrl_fd stays
+         * -1 — all live fds live in workers[] only. This avoids a
+         * double-free bug where portal_module_unload + reconnect_dead_peers
+         * would call node_fd_del_with_rx twice on the same fd (once via
+         * ctrl_fd, once via workers[0]), hitting a freed rx_state_t on
+         * the second call. Display code at /node/resources/... already
+         * falls back to workers[0].ssl when ctrl_ssl is NULL, and
+         * find_peer_by_fd/ssl_for_fd/mark_peer_dead_by_fd already scan
+         * both arrays. Inbound peers still use ctrl_fd (worker_count=0). */
+        pthread_mutex_lock(&peer->lock);
+        if (peer->worker_count < NODE_MAX_THREADS) {
+            int slot = peer->worker_count++;
+            peer->workers[slot].fd = client_fd;
+            peer->workers[slot].busy = 0;
+#ifdef HAS_SSL
+            peer->workers[slot].ssl = ssl;
+#endif
+        }
+        pthread_mutex_unlock(&peer->lock);
+
+        /* First completion → register path + mark ready */
+        if (!peer->ready) {
+            char path[PORTAL_MAX_PATH_LEN];
+            snprintf(path, sizeof(path), "/%s/*", peer->name);
+            if (g_core->path_register(g_core, path, "node") == 0) {
+                g_core->path_set_access(g_core, path, PORTAL_ACCESS_RW);
+                snprintf(peer->paths[0], NODE_PEER_PATH_LEN, "%.*s",
+                         (int)(NODE_PEER_PATH_LEN - 1), path);
+                peer->path_count = 1;
+            }
+            peer->ready = 1;
+            peer->dead = 0;
+            peer->connected_at = time(NULL);
+            /* Reset exponential backoff on successful connection */
+            peer->retry_count = 0;
+            peer->next_retry_us = 0;
+
+            g_core->log(g_core, PORTAL_LOG_INFO, "node",
+                        "Connected to peer '%s' at %s:%d (async, %d workers)%s",
+                        peer->name, peer->host, peer->port,
+                        g_threads_per_peer, tls_tag);
+
+            /* Register indirect peers advertised during handshake */
+            int hub_idx = -1;
+            for (int i = 0; i < g_peer_count; i++) {
+                if (g_peers[i] == peer) { hub_idx = i; break; }
+            }
+            if (hub_idx >= 0) {
+                for (int rp = 0; rp < hs->adv_count; rp++)
+                    register_indirect_peer(hs->advertised[rp], hub_idx);
+            }
+        } else {
+            g_core->log(g_core, PORTAL_LOG_DEBUG, "node",
+                        "Outbound worker connection to '%s' (%d/%d)%s",
+                        peer->name, peer->worker_count,
+                        g_threads_per_peer, tls_tag);
+        }
+
+        hs_context_free(rx->hs);
+        rx->hs = NULL;
+        conn_set_state(rx, CONN_STATE_READY);
+        return;
+    }
+
+    /* ── Inbound path (Commit 5, unchanged) ───────────────────────── */
+
+    /* Check if this fd is a worker connection from an already-known peer */
+    node_peer_t *existing = find_peer_by_name(hs->peer_name);
+    if (existing) {
+        if (existing->worker_count < NODE_MAX_THREADS) {
+            pthread_mutex_lock(&existing->lock);
+            worker_t *w = &existing->workers[existing->worker_count++];
+            w->fd = client_fd;
+            w->busy = 0;
+#ifdef HAS_SSL
+            w->ssl = ssl;
+#endif
+            pthread_mutex_unlock(&existing->lock);
+        }
+        /* Transition fd to READY; keep the rx_state_t registered. The
+         * old blocking flow called node_fd_add_with_rx here; we already
+         * have the fd in the event loop via node_fd_add_inbound_handshake,
+         * so just free the handshake scratch and flip the state. */
+        hs_context_free(rx->hs);
+        rx->hs = NULL;
+        conn_set_state(rx, CONN_STATE_READY);
+        g_core->log(g_core, PORTAL_LOG_DEBUG, "node",
+                    "Worker connection from '%s' (%d/%d)%s",
+                    hs->peer_name, existing->worker_count,
+                    NODE_MAX_THREADS, tls_tag);
+        return;
+    }
+
+    /* New peer — allocate a node_peer_t and register path */
+    int new_idx = peers_append();
+    if (new_idx < 0) {
+        hs_abort(client_fd, "peers_append failed (cap reached)");
+        return;
+    }
+
+    node_peer_t *peer = g_peers[new_idx];
+    pthread_mutex_init(&peer->lock, NULL);
+    snprintf(peer->name, sizeof(peer->name), "%s", hs->peer_name);
+    snprintf(peer->host, sizeof(peer->host), "%s",
+             inet_ntoa(hs->peer_addr.sin_addr));
+    peer->port = ntohs(hs->peer_addr.sin_port);
+    peer->ctrl_fd = client_fd;
+#ifdef HAS_SSL
+    peer->ctrl_ssl = ssl;
+#endif
+    peer->is_inbound = 1;
+    peer->worker_count = 0;
+    peer->ready = 1;
+    peer->connected_at = time(NULL);
+
+    /* Register wildcard path for this peer */
+    char path[PORTAL_MAX_PATH_LEN];
+    snprintf(path, sizeof(path), "/%s/*", peer->name);
+    int preg = g_core->path_register(g_core, path, "node");
+    if (preg == 0) {
+        g_core->path_set_access(g_core, path, PORTAL_ACCESS_RW);
+        g_core->log(g_core, PORTAL_LOG_INFO, "node",
+                    "Registered path '%s' for peer '%s'", path, peer->name);
+    } else {
+        g_core->log(g_core, PORTAL_LOG_ERROR, "node",
+                    "FAILED to register path '%s' for peer '%s' (rc=%d)",
+                    path, peer->name, preg);
+    }
+    snprintf(peer->paths[0], NODE_PEER_PATH_LEN, "%.*s",
+             (int)(NODE_PEER_PATH_LEN - 1), path);
+    peer->path_count = 1;
+
+    g_core->log(g_core, PORTAL_LOG_INFO, "node",
+                "Peer '%s' connected (inbound from %s)%s",
+                peer->name, peer->host, tls_tag);
+
+    /* Register indirect peers advertised by this peer */
+    int hub_idx = new_idx;
+    for (int rp = 0; rp < hs->adv_count; rp++)
+        register_indirect_peer(hs->advertised[rp], hub_idx);
+
+    /* Free handshake scratch and flip to READY */
+    hs_context_free(rx->hs);
+    rx->hs = NULL;
+    conn_set_state(rx, CONN_STATE_READY);
+}
+
+/* Register an inbound accepted fd in the event loop starting from
+ * CONN_STATE_TLS_ACCEPT. Allocates the rx_state_t, hs_context_t, and
+ * SSL object. On error, frees everything and closes the fd. */
+static int node_fd_add_inbound_handshake(int client_fd,
+                                          const struct sockaddr_in *peer_addr)
+{
+    if (!g_rx_ht_inited) {
+        portal_ht_init(&g_rx_by_fd, 256);
+        g_rx_ht_inited = 1;
+    }
+
+    set_nonblocking(client_fd);
+
+    rx_state_t *rx = rx_alloc(client_fd);
+    if (!rx) return -1;
+
+    rx->hs = calloc(1, sizeof(hs_context_t));
+    if (!rx->hs) { free(rx); return -1; }
+    rx->hs->peer_addr = *peer_addr;
+    rx->hs->recv_phase = 0;
+
+#ifdef HAS_SSL
+    SSL *ssl = NULL;
+    if (g_tls_enabled && g_ssl_server_ctx) {
+        ssl = SSL_new(g_ssl_server_ctx);
+        if (!ssl) { hs_context_free(rx->hs); free(rx); return -1; }
+        SSL_set_fd(ssl, client_fd);
+        SSL_set_accept_state(ssl);
+        rx->ssl = ssl;
+        conn_set_state(rx, CONN_STATE_TLS_ACCEPT);
+    } else {
+        /* No TLS — skip straight to HS_EXCHANGE */
+        conn_set_state(rx, CONN_STATE_HS_EXCHANGE);
+    }
+#else
+    conn_set_state(rx, CONN_STATE_HS_EXCHANGE);
+#endif
+
+    /* Register in the hashtable and event loop with EV_READ|EV_WRITE so
+     * the first wakeup immediately drives the handshake forward. */
+    char key[16];
+    rx_key(client_fd, key, sizeof(key));
+    portal_ht_set(&g_rx_by_fd, key, rx);
+
+    rx->events = EV_READ | EV_WRITE;
+    if (g_core->fd_add(g_core, client_fd, EV_READ | EV_WRITE,
+                       on_inbound_data, rx) < 0) {
+        portal_ht_del(&g_rx_by_fd, key);
+        rx_free(rx);
+        return -1;
+    }
+
+    /* If no TLS and we're already in HS_EXCHANGE state, queue the
+     * PORTAL02 send bytes immediately so they go out on the first
+     * on_writable callback. */
+    if (rx->conn_state == CONN_STATE_HS_EXCHANGE)
+        drive_hs_send_build(rx);
+
+    return 0;
+}
+
+/* Commit 6: start an async outbound connect on a fresh non-blocking
+ * socket. Allocates the fd_state_t + hs_context_t with peer backref set,
+ * registers the fd in CONN_STATE_TCP_CONNECTING with EV_WRITE so libev
+ * wakes us when connect() completes. Returns 0 on success, -1 on error
+ * (peer's retry_count is NOT incremented here — the caller is expected
+ * to handle backoff accounting).
+ *
+ * On immediate failure (socket, connect fails synchronously) the fd is
+ * closed cleanly before returning -1. No dangling state. */
+static int node_fd_add_outbound_handshake(node_peer_t *peer)
+{
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+
+    /* TCP keepalive */
+    int ka = 1;
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &ka, sizeof(ka));
+#ifdef TCP_KEEPIDLE
+    int kidle = 60;
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &kidle, sizeof(kidle));
+#endif
+#ifdef TCP_KEEPINTVL
+    int kintvl = 30;
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &kintvl, sizeof(kintvl));
+#endif
+#ifdef TCP_KEEPCNT
+    int kcnt = 3;
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &kcnt, sizeof(kcnt));
+#endif
+
+    if (set_nonblocking(fd) < 0) { close(fd); return -1; }
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)peer->cfg_port);
+    if (inet_pton(AF_INET, peer->cfg_host, &addr.sin_addr) <= 0) {
+        close(fd);
+        return -1;
+    }
+
+    int crc = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
+    if (crc < 0 && errno != EINPROGRESS) {
+        close(fd);
+        return -1;
+    }
+
+    /* Allocate fd_state_t and hs_context_t */
+    if (!g_rx_ht_inited) {
+        portal_ht_init(&g_rx_by_fd, 256);
+        g_rx_ht_inited = 1;
+    }
+    rx_state_t *rx = rx_alloc(fd);
+    if (!rx) { close(fd); return -1; }
+
+    rx->hs = calloc(1, sizeof(hs_context_t));
+    if (!rx->hs) { free(rx); close(fd); return -1; }
+    rx->hs->peer_addr = addr;
+    rx->hs->peer = peer;
+    rx->hs->is_outbound = 1;
+    rx->hs->recv_phase = 0;
+
+    conn_set_state(rx, CONN_STATE_TCP_CONNECTING);
+
+    char key[16];
+    rx_key(fd, key, sizeof(key));
+    portal_ht_set(&g_rx_by_fd, key, rx);
+
+    rx->events = EV_READ | EV_WRITE;
+    if (g_core->fd_add(g_core, fd, EV_READ | EV_WRITE,
+                       on_inbound_data, rx) < 0) {
+        portal_ht_del(&g_rx_by_fd, key);
+        rx_free(rx);
+        return -1;
+    }
+
+    return 0;
+}
+
+/* Commit 6: replaces the old blocking connect_to_peer. Creates a
+ * node_peer_t and kicks off N parallel async connects (1 control +
+ * g_threads_per_peer workers). Returns 0 on success, -1 if peers_append
+ * fails or all socket creations fail.
+ *
+ * The peer starts in ready=0 state. finalize_handshake transitions it
+ * to ready=1 after the first connection completes the full TLS +
+ * PORTAL02 handshake. */
+static int connect_to_peer_async(const char *name, const char *host, int port)
+{
+    /* If peer already exists (reconnect case), reuse it */
+    node_peer_t *peer = NULL;
+    for (int i = 0; i < g_peer_count; i++) {
+        if (strcmp(g_peers[i]->name, name) == 0) {
+            peer = g_peers[i];
+            break;
+        }
+    }
+
+    if (!peer) {
+        int idx = peers_append();
+        if (idx < 0) return -1;
+        peer = g_peers[idx];
+        pthread_mutex_init(&peer->lock, NULL);
+        snprintf(peer->name, sizeof(peer->name), "%s", name);
+        snprintf(peer->host, sizeof(peer->host), "%s", host);
+        snprintf(peer->cfg_host, sizeof(peer->cfg_host), "%s", host);
+        peer->port = port;
+        peer->cfg_port = port;
+        peer->is_inbound = 0;
+        peer->is_indirect = 0;
+        peer->ctrl_fd = -1;
+        peer->worker_count = 0;
+        peer->ready = 0;
+        peer->dead = 0;
+        peer->connected_at = 0;
+        peer->retry_count = 0;
+        peer->next_retry_us = 0;
+    } else {
+        /* Reconnect case — reset state so finalize_handshake will mark
+         * it ready on first successful handshake */
+        peer->ready = 0;
+        peer->ctrl_fd = -1;
+        peer->worker_count = 0;
+    }
+
+    /* Start N+1 parallel async connects: 1 for control + g_threads_per_peer
+     * for workers. Each one independently drives the state machine. */
+    int total = 1 + g_threads_per_peer;
+    if (total > NODE_MAX_THREADS) total = NODE_MAX_THREADS;
+
+    int started = 0;
+    for (int i = 0; i < total; i++) {
+        if (node_fd_add_outbound_handshake(peer) == 0)
+            started++;
+    }
+
+    if (started == 0) {
+        /* All socket creates failed — mark dead and back off */
+        peer->dead = 1;
+        peer->retry_count++;
+        uint64_t backoff[] = {1, 2, 5, 10, 30};
+        int bi = peer->retry_count - 1;
+        if (bi >= (int)(sizeof(backoff)/sizeof(backoff[0])))
+            bi = (int)(sizeof(backoff)/sizeof(backoff[0])) - 1;
+        peer->next_retry_us = now_us() + backoff[bi] * 1000000ULL;
+        return -1;
+    }
+
+    g_core->log(g_core, PORTAL_LOG_INFO, "node",
+                "Async connect to '%s' at %s:%d started (%d/%d fds)",
+                name, host, port, started, total);
+    return 0;
+}
+
+/* Drive the handshake state machine. Called from on_inbound_data when
+ * rx->conn_state is not READY. Handles both TLS and PORTAL02 phases.
+ * Returns 0 on success (state progressed or waiting), -1 on hard error
+ * (caller should abort the fd). */
+static int drive_handshake(rx_state_t *rx, uint32_t events)
+{
+    /* Phase 0: TCP connect in progress (outbound). When libev fires
+     * EV_WRITE, the socket is writable → connect() finished. Check
+     * SO_ERROR to distinguish success from failure. */
+    if (rx->conn_state == CONN_STATE_TCP_CONNECTING) {
+        if (!(events & EV_WRITE))
+            return 0;  /* wait for writable */
+        int soerr = 0;
+        socklen_t slen = sizeof(soerr);
+        if (getsockopt(rx->fd, SOL_SOCKET, SO_ERROR, &soerr, &slen) < 0)
+            return -1;
+        if (soerr != 0) {
+            errno = soerr;
+            return -1;
+        }
+        /* connect() succeeded. If TLS is enabled, create the SSL and
+         * move to TLS_CONNECT; otherwise skip to HS_EXCHANGE. */
+#ifdef HAS_SSL
+        if (g_tls_enabled && g_ssl_client_ctx) {
+            SSL *ssl = SSL_new(g_ssl_client_ctx);
+            if (!ssl) return -1;
+            SSL_set_fd(ssl, rx->fd);
+            SSL_set_connect_state(ssl);
+            rx->ssl = ssl;
+            conn_set_state(rx, CONN_STATE_TLS_CONNECT);
+        } else
+#endif
+        {
+            conn_set_state(rx, CONN_STATE_HS_EXCHANGE);
+            drive_hs_send_build(rx);
+        }
+        /* Drop EV_WRITE — the TLS/HS driver will re-enable if needed */
+        fd_state_stop_writable(rx);
+    }
+
+    /* Phase A: TLS handshake. Handles both inbound (TLS_ACCEPT) and
+     * outbound (TLS_CONNECT) — SSL_do_handshake is direction-agnostic. */
+#ifdef HAS_SSL
+    if (rx->conn_state == CONN_STATE_TLS_ACCEPT ||
+        rx->conn_state == CONN_STATE_TLS_CONNECT) {
+        int rc = drive_tls(rx);
+        if (rc < 0) return -1;
+        if (rc == 0) return 0;  /* want more I/O */
+        /* rc == 1 → TLS done, fell through to HS_EXCHANGE */
+    }
+#else
+    (void)events;
+#endif
+
+    /* Phase B: HS_EXCHANGE — send and recv concurrently */
+    if (rx->conn_state == CONN_STATE_HS_EXCHANGE) {
+        /* Send half: drain tx_buf when EV_WRITE fires. on_writable is
+         * called from the main on_inbound_data entry block before us,
+         * so by the time we're here tx_buf draining has already
+         * progressed. Mark hs->send_done when fully drained. */
+        if (rx->hs && rx->hs->send_queued && rx->tx_len == 0)
+            rx->hs->send_done = 1;
+
+        /* Recv half: drain bytes from the socket into rx->buf, then
+         * parse what we have. We need to read bytes manually here
+         * (the normal Phase 1-3 reader assumes a length-prefixed
+         * framed message, which the handshake isn't). */
+        (void)events;  /* we act based on rx state, not event mask */
+        void *ssl = NULL;
+#ifdef HAS_SSL
+        ssl = rx->ssl;
+#endif
+        /* Make sure the rx buffer has room to grow */
+        if (rx->cap < 4096) {
+            uint8_t *nb = realloc(rx->buf, 4096);
+            if (!nb) return -1;
+            rx->buf = nb;
+            rx->cap = 4096;
+        }
+
+        while (rx->len < rx->cap) {
+            ssize_t n = node_read_nb(rx->fd, ssl, rx->buf + rx->len,
+                                      rx->cap - rx->len);
+            if (n > 0) {
+                rx->len += (size_t)n;
+                continue;
+            }
+            if (n == -2) break;  /* would block */
+            /* EOF or hard error */
+            return -1;
+        }
+
+        int prc = drive_hs_recv(rx);
+        if (prc == -2) return -1;   /* auth failure */
+        if (prc == -1) return -1;   /* protocol error */
+        if (prc == 1 && rx->hs) rx->hs->recv_done = 1;
+
+        if (rx->hs && rx->hs->send_done && rx->hs->recv_done) {
+            /* Both halves complete — finalize */
+            finalize_handshake(rx);
+            /* After finalize, rx->conn_state == READY and rx->hs == NULL.
+             * Reset rx_len so the incremental reader starts fresh for
+             * the first real message. */
+            rx->len = 0;
+            rx->need = 0;
+            return 0;
+        }
+    }
+
+    return 0;
+}
+
+/* --- Inbound peer handling ---
+ *
+ * Incremental reader (Commit 3): on_inbound_data is invoked by libev when
+ * the fd is readable. It accumulates bytes into a per-fd rx_state_t
+ * across multiple invocations so a partial frame does not stall the
+ * event loop. When a complete frame is in rx->buf, it's decoded and
+ * dispatched, then rx_reset() prepares for the next frame.
+ *
+ * The fd MUST be non-blocking. node_read_nb() returns -2 if the read
+ * would block; the callback returns and waits for the next libev event.
+ */
 
 static void on_inbound_data(int fd, uint32_t events, void *userdata)
 {
-    (void)userdata;
+    rx_state_t *rx = (rx_state_t *)userdata;
     if (events & EV_ERROR) {
         mark_peer_dead_by_fd(fd);
 #ifdef HAS_SSL
-        node_ssl_close(fd, fd_ssl_get(fd));
+        node_ssl_close(fd, rx ? rx->ssl : ssl_for_fd(fd));
+        if (rx) rx->ssl = NULL;
 #endif
-        g_core->fd_del(g_core, fd);
+        node_fd_del_with_rx(fd);
         close(fd);
         return;
     }
+
+    if (!rx) {
+        /* Defensive: fd was registered without rx_state (should not
+         * happen after Commit 3). Close it to force a fresh registration. */
+        node_fd_del_with_rx(fd);
+        close(fd);
+        return;
+    }
+
+    /* Commit 4c: handle EV_WRITE first — drain any queued response
+     * bytes in rx->tx_buf. on_writable is a no-op if the buffer is
+     * empty or already drained. */
+    if (events & EV_WRITE)
+        on_writable(rx);
+
+    /* Commit 5: dispatch on connection state. Transient handshake
+     * conns skip the normal incremental reader entirely. */
+    if (rx->conn_state != CONN_STATE_READY) {
+        int rc = drive_handshake(rx, events);
+        if (rc < 0) {
+            hs_abort(fd, "handshake driver returned error");
+            return;
+        }
+        /* If handshake just finalized, rx->conn_state is now READY and
+         * we fall through to the normal reader to start processing the
+         * first post-handshake frame (rx->len was reset by finalize). */
+        if (rx->conn_state != CONN_STATE_READY)
+            return;
+    }
+
+    /* If libev only signaled EV_WRITE (no EV_READ), we're done. Common
+     * when the only reason we were woken was because the socket became
+     * writable after a partial drain. */
+    if (!(events & EV_READ))
+        return;
 
     void *ssl = NULL;
 #ifdef HAS_SSL
-    ssl = fd_ssl_get(fd);
+    ssl = rx->ssl;
 #endif
 
-    /* Read wire message */
-    uint8_t hdr[4];
-    ssize_t n = node_read_partial(fd, ssl, hdr, 4);
-    if (n != 4) {
-        mark_peer_dead_by_fd(fd);
+read_more:
+    /* Phase 1: read the 4-byte length header if we don't have it yet */
+    while (rx->len < 4) {
+        if (!rx->buf) {
+            rx->buf = malloc(4);
+            if (!rx->buf) {
+                mark_peer_dead_by_fd(fd);
+                node_fd_del_with_rx(fd);
+                close(fd);
+                return;
+            }
+            rx->cap = 4;
+        }
+        ssize_t n = node_read_nb(fd, ssl, rx->buf + rx->len, 4 - rx->len);
+        if (n > 0) {
+            rx->len += (size_t)n;
+        } else if (n == -2) {
+            return;   /* would block — wait for next event */
+        } else {
+            /* EOF or hard error */
+            mark_peer_dead_by_fd(fd);
 #ifdef HAS_SSL
-        node_ssl_close(fd, ssl);
+            node_ssl_close(fd, ssl);
 #endif
-        g_core->fd_del(g_core, fd);
-        close(fd);
+            node_fd_del_with_rx(fd);
+            close(fd);
+            return;
+        }
+    }
+
+    /* Phase 2: parse length header and ensure buffer capacity */
+    if (rx->need == 0) {
+        int32_t msg_len = portal_wire_read_length(rx->buf);
+        if (msg_len <= 0 || msg_len > NODE_BUF_SIZE) {
+            /* Invalid frame — treat as protocol error */
+            mark_peer_dead_by_fd(fd);
+#ifdef HAS_SSL
+            node_ssl_close(fd, ssl);
+#endif
+            node_fd_del_with_rx(fd);
+            close(fd);
+            return;
+        }
+        rx->need = 4 + (size_t)msg_len;
+        if (rx->need > rx->cap) {
+            uint8_t *nb = realloc(rx->buf, rx->need);
+            if (!nb) {
+                mark_peer_dead_by_fd(fd);
+                node_fd_del_with_rx(fd);
+                close(fd);
+                return;
+            }
+            rx->buf = nb;
+            rx->cap = rx->need;
+        }
+    }
+
+    /* Phase 3: read the body until we have rx->need bytes */
+    while (rx->len < rx->need) {
+        ssize_t n = node_read_nb(fd, ssl, rx->buf + rx->len, rx->need - rx->len);
+        if (n > 0) {
+            rx->len += (size_t)n;
+        } else if (n == -2) {
+            return;   /* would block — wait for next event */
+        } else {
+            mark_peer_dead_by_fd(fd);
+#ifdef HAS_SSL
+            node_ssl_close(fd, ssl);
+#endif
+            node_fd_del_with_rx(fd);
+            close(fd);
+            return;
+        }
+    }
+
+    /* Phase 4: we have a complete frame at rx->buf, length rx->need.
+     *
+     * Commit 4d: distinguish response-vs-request by checking the pending
+     * FIFO on this conn. If pending_head is non-null, we are expecting a
+     * response to an outbound peer_send_wait call — decode as
+     * portal_resp_t, match to the head of the queue, and wake the waiter.
+     * Otherwise, decode as portal_msg_t and dispatch locally.
+     *
+     * TCP byte-order guarantee means responses on a given conn arrive in
+     * the same order the requests were sent (FIFO). Single-threaded mod_node
+     * dispatch ensures the peer never interleaves a new request with a
+     * response on the same conn — known latent limitation: a handler that
+     * recursively core->sends to the same peer could break FIFO order.
+     * Not an active bug in SSIP's flow. */
+
+    if (rx->pending_head) {
+        /* Response match to the oldest pending request on this conn */
+        pending_req_t *pr = rx->pending_head;
+        portal_resp_t tmp = {0};
+        int decoded = portal_wire_decode_resp(rx->buf, rx->need, &tmp);
+        if (decoded == 0 && pr->resp) {
+            /* Transfer ownership of decoded fields into the caller's resp.
+             * Zero the tmp aliases so we don't double-free if the caller
+             * later runs portal_resp_free on pr->resp. */
+            pr->resp->status = tmp.status;
+            pr->resp->header_count = tmp.header_count;
+            pr->resp->headers = tmp.headers;   tmp.headers = NULL;
+            pr->resp->body = tmp.body;         tmp.body = NULL;
+            pr->resp->body_len = tmp.body_len;
+            pr->rc = 0;
+        } else {
+            /* Decode failed — fail the waiter. tmp contents (if any) will
+             * be freed below via the cleanup block. */
+            if (pr->resp) pr->resp->status = PORTAL_INTERNAL_ERROR;
+            pr->rc = -1;
+            if (tmp.headers) {
+                for (uint16_t i = 0; i < tmp.header_count; i++) {
+                    free(tmp.headers[i].key);
+                    free(tmp.headers[i].value);
+                }
+                free(tmp.headers);
+            }
+            free(tmp.body);
+        }
+        pr->done = 1;
+
+        /* Pop pr from FIFO head */
+        rx->pending_head = pr->next;
+        if (rx->pending_tail == pr) rx->pending_tail = NULL;
+        rx->pending_count--;
+        /* pr itself is freed by the waiter in peer_send_wait */
+
+        rx_reset(rx);
+#ifdef HAS_SSL
+        if (ssl && SSL_pending((SSL *)ssl) > 0) goto read_more;
+#endif
         return;
     }
 
-    int32_t msg_len = portal_wire_read_length(hdr);
-    if (msg_len <= 0 || msg_len > NODE_BUF_SIZE) return;
-
-    uint8_t *buf = malloc((size_t)msg_len + 4);
-    memcpy(buf, hdr, 4);
-    size_t remaining = (size_t)msg_len;
-    size_t got = 0;
-    while (got < remaining) {
-        ssize_t rd = node_read_partial(fd, ssl, buf + 4 + got, remaining - got);
-        if (rd <= 0) { free(buf); return; }
-        got += (size_t)rd;
-    }
+    /* No pending request on this conn → incoming frame is a REQUEST from
+     * the peer. Dispatch exactly like the pre-refactor reader did. */
+    uint8_t *buf = rx->buf;
+    int32_t msg_len = (int32_t)(rx->need - 4);
 
     /* Decode and route locally */
     portal_msg_t incoming = {0};
@@ -928,7 +2239,8 @@ static void on_inbound_data(int fd, uint32_t events, void *userdata)
                 free(incoming.ctx->auth.token);
                 free(incoming.ctx);
             }
-            free(buf);
+            /* start_pipe took ownership of the fd and called fd_del,
+             * which freed our rx_state_t. Do NOT touch rx after this. */
             return;
         }
 
@@ -943,14 +2255,25 @@ static void on_inbound_data(int fd, uint32_t events, void *userdata)
         /* Normal message routing */
         g_core->send(g_core, &incoming, &resp);
 
-        /* Encode and send response */
+        /* Commit 4c: queue the encoded response in rx->tx_buf and
+         * enable EV_WRITE on the fd. on_writable (called by the next
+         * libev wakeup, which is usually immediate because the socket
+         * is almost always writable) will drain it without blocking
+         * the event loop. */
         uint8_t *resp_buf = NULL;
         size_t resp_len = 0;
         if (portal_wire_encode_resp(&resp, &resp_buf, &resp_len) == 0) {
-            node_send(fd, ssl, resp_buf, resp_len);
-            if (src_peer) {
-                src_peer->msgs_sent++;
-                src_peer->bytes_sent += resp_len;
+            if (fd_state_tx_append(rx, resp_buf, resp_len) == 0) {
+                fd_state_ensure_writable(rx);
+                if (src_peer) {
+                    src_peer->msgs_sent++;
+                    src_peer->bytes_sent += resp_len;
+                }
+            } else {
+                /* Allocation failure — drop the response. The peer will
+                 * eventually time out waiting for it, which mirrors
+                 * the pre-Commit-4c behavior on a failed node_send. */
+                if (src_peer) src_peer->errors++;
             }
             free(resp_buf);
         }
@@ -969,240 +2292,78 @@ static void on_inbound_data(int fd, uint32_t events, void *userdata)
         }
         free(resp.body);
     }
-    free(buf);
+    /* Reset rx_state for the next frame; keep rx->buf allocated for reuse */
+    rx_reset(rx);
+
+    /* If the TLS socket has more data buffered internally, libev will NOT
+     * wake us again because the underlying fd is empty. Loop back and drain. */
+#ifdef HAS_SSL
+    if (ssl && SSL_pending((SSL *)ssl) > 0) goto read_more;
+#endif
 }
 
 static void on_new_peer(int fd, uint32_t events, void *userdata)
 {
     (void)events; (void)userdata;
 
-    struct sockaddr_in addr;
-    socklen_t alen = sizeof(addr);
-    int client_fd = accept(fd, (struct sockaddr *)&addr, &alen);
-    if (client_fd < 0) return;
+    /* Commit 5: non-blocking accept loop. Drain the listener's backlog
+     * by looping accept4(SOCK_NONBLOCK) until it returns EAGAIN. Each
+     * accepted fd starts in CONN_STATE_TLS_ACCEPT; the handshake is
+     * driven asynchronously by on_inbound_data + drive_handshake. */
+    for (;;) {
+        struct sockaddr_in addr;
+        socklen_t alen = sizeof(addr);
+        int client_fd = accept4(fd, (struct sockaddr *)&addr, &alen,
+                                 SOCK_NONBLOCK);
+        if (client_fd < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+                break;
+            if (g_core)
+                g_core->log(g_core, PORTAL_LOG_WARN, "node",
+                            "accept4 failed: %s", strerror(errno));
+            break;
+        }
 
-    /* TCP keepalive on accepted connections */
-    int ka = 1;
-    setsockopt(client_fd, SOL_SOCKET, SO_KEEPALIVE, &ka, sizeof(ka));
+        /* TCP keepalive on accepted connections */
+        int ka = 1;
+        setsockopt(client_fd, SOL_SOCKET, SO_KEEPALIVE, &ka, sizeof(ka));
 #ifdef TCP_KEEPIDLE
-    int kidle = 60;
-    setsockopt(client_fd, IPPROTO_TCP, TCP_KEEPIDLE, &kidle, sizeof(kidle));
+        int kidle = 60;
+        setsockopt(client_fd, IPPROTO_TCP, TCP_KEEPIDLE, &kidle, sizeof(kidle));
 #endif
 #ifdef TCP_KEEPINTVL
-    int kintvl = 30;
-    setsockopt(client_fd, IPPROTO_TCP, TCP_KEEPINTVL, &kintvl, sizeof(kintvl));
+        int kintvl = 30;
+        setsockopt(client_fd, IPPROTO_TCP, TCP_KEEPINTVL, &kintvl, sizeof(kintvl));
 #endif
 #ifdef TCP_KEEPCNT
-    int kcnt = 3;
-    setsockopt(client_fd, IPPROTO_TCP, TCP_KEEPCNT, &kcnt, sizeof(kcnt));
+        int kcnt = 3;
+        setsockopt(client_fd, IPPROTO_TCP, TCP_KEEPCNT, &kcnt, sizeof(kcnt));
 #endif
 
-    void *ssl = NULL;
-#ifdef HAS_SSL
-    if (g_tls_enabled) {
-        ssl = node_tls_accept(client_fd);
-        if (!ssl) {
+        /* Register the fd in TLS_ACCEPT state. The driver kicks off
+         * SSL_do_handshake on the first readable/writable event. */
+        if (node_fd_add_inbound_handshake(client_fd, &addr) < 0) {
             g_core->log(g_core, PORTAL_LOG_WARN, "node",
-                        "TLS handshake failed from %s — rejected",
+                        "Failed to register inbound handshake for %s",
                         inet_ntoa(addr.sin_addr));
             close(client_fd);
-            return;
+            continue;
         }
     }
-#endif
-
-    /* Wire protocol handshake */
-    send_handshake(client_fd, ssl);
-    char peer_name[PORTAL_MAX_MODULE_NAME];
-    char remote_peers[NODE_MAX_PEERS][PORTAL_MAX_MODULE_NAME];
-    int remote_peer_count = 0;
-    int hrc = recv_handshake(client_fd, ssl, peer_name, sizeof(peer_name),
-                              remote_peers, &remote_peer_count);
-    if (hrc < 0) {
-        if (hrc == -2)
-            g_core->log(g_core, PORTAL_LOG_WARN, "node",
-                        "Rejected peer from %s — bad federation key",
-                        inet_ntoa(addr.sin_addr));
-#ifdef HAS_SSL
-        if (ssl) node_ssl_close(client_fd, ssl);
-#endif
-        close(client_fd);
-        return;
-    }
-
-    /* Check if this is a worker connection from an already-known peer */
-    node_peer_t *existing = find_peer_by_name(peer_name);
-    if (existing) {
-        if (existing->worker_count < NODE_MAX_THREADS) {
-            pthread_mutex_lock(&existing->lock);
-            worker_t *w = &existing->workers[existing->worker_count++];
-            w->fd = client_fd;
-            w->busy = 0;
-#ifdef HAS_SSL
-            w->ssl = ssl;
-#endif
-            pthread_mutex_unlock(&existing->lock);
-        }
-        g_core->fd_add(g_core, client_fd, EV_READ, on_inbound_data, NULL);
-        g_core->log(g_core, PORTAL_LOG_DEBUG, "node",
-                    "Worker connection from '%s' (%d/%d)%s",
-                    peer_name, existing->worker_count, NODE_MAX_THREADS,
-                    ssl ? " [TLS]" : "");
-        return;
-    }
-
-    /* New peer */
-    if (g_peer_count >= NODE_MAX_PEERS) {
-#ifdef HAS_SSL
-        if (ssl) node_ssl_close(client_fd, ssl);
-#endif
-        close(client_fd);
-        return;
-    }
-
-    node_peer_t *peer = &g_peers[g_peer_count++];
-    memset(peer, 0, sizeof(*peer));
-    pthread_mutex_init(&peer->lock, NULL);
-    snprintf(peer->name, sizeof(peer->name), "%s", peer_name);
-    snprintf(peer->host, sizeof(peer->host), "%s", inet_ntoa(addr.sin_addr));
-    peer->port = ntohs(addr.sin_port);
-    peer->ctrl_fd = client_fd;
-#ifdef HAS_SSL
-    peer->ctrl_ssl = ssl;
-#endif
-    peer->is_inbound = 1;
-    peer->worker_count = 0;
-    peer->ready = 1;
-    peer->connected_at = time(NULL);
-
-    /* Register wildcard path for this peer */
-    char path[PORTAL_MAX_PATH_LEN];
-    snprintf(path, sizeof(path), "/%s/*", peer->name);
-    int preg = g_core->path_register(g_core, path, "node");
-    if (preg == 0) {
-        g_core->path_set_access(g_core, path, PORTAL_ACCESS_RW);
-        g_core->log(g_core, PORTAL_LOG_INFO, "node",
-                    "Registered path '%s' for peer '%s'", path, peer->name);
-    } else {
-        g_core->log(g_core, PORTAL_LOG_ERROR, "node",
-                    "FAILED to register path '%s' for peer '%s' (rc=%d)",
-                    path, peer->name, preg);
-    }
-    snprintf(peer->paths[0], NODE_PEER_PATH_LEN, "%.*s",
-                (int)(NODE_PEER_PATH_LEN - 1), path);
-    peer->path_count = 1;
-
-    g_core->fd_add(g_core, client_fd, EV_READ, on_inbound_data, NULL);
-
-    g_core->log(g_core, PORTAL_LOG_INFO, "node",
-                "Peer '%s' connected (inbound from %s)%s",
-                peer_name, peer->host, ssl ? " [TLS]" : "");
-
-    /* Register indirect peers advertised by this peer */
-    int hub_idx = (int)(peer - g_peers);
-    for (int rp = 0; rp < remote_peer_count; rp++)
-        register_indirect_peer(remote_peers[rp], hub_idx);
 }
 
-/* --- Connect to a configured remote peer --- */
-
-static int connect_to_peer(const char *name, const char *host, int port)
-{
-    int fd = create_connection(host, port);
-    if (fd < 0) {
-        g_core->log(g_core, PORTAL_LOG_WARN, "node",
-                    "Cannot connect to '%s' at %s:%d", name, host, port);
-        return -1;
-    }
-
-    void *ssl = NULL;
-#ifdef HAS_SSL
-    if (g_tls_enabled) {
-        ssl = node_tls_connect(fd);
-        if (!ssl) {
-            g_core->log(g_core, PORTAL_LOG_WARN, "node",
-                        "TLS connect to '%s' failed", name);
-            close(fd);
-            return -1;
-        }
-    }
-#endif
-
-    send_handshake(fd, ssl);
-    char remote_name[PORTAL_MAX_MODULE_NAME];
-    char remote_peers[NODE_MAX_PEERS][PORTAL_MAX_MODULE_NAME];
-    int remote_peer_count = 0;
-    int hrc = recv_handshake(fd, ssl, remote_name, sizeof(remote_name),
-                              remote_peers, &remote_peer_count);
-    if (hrc < 0) {
-        if (hrc == -2)
-            g_core->log(g_core, PORTAL_LOG_WARN, "node",
-                        "Rejected by '%s' — federation key mismatch", name);
-#ifdef HAS_SSL
-        if (ssl) node_ssl_close(fd, ssl);
-#endif
-        close(fd);
-        return -1;
-    }
-
-    if (g_peer_count >= NODE_MAX_PEERS) {
-#ifdef HAS_SSL
-        if (ssl) node_ssl_close(fd, ssl);
-#endif
-        close(fd);
-        return -1;
-    }
-
-    node_peer_t *peer = &g_peers[g_peer_count++];
-    memset(peer, 0, sizeof(*peer));
-    pthread_mutex_init(&peer->lock, NULL);
-    snprintf(peer->name, sizeof(peer->name), "%s",
-             remote_name[0] ? remote_name : name);
-    snprintf(peer->host, sizeof(peer->host), "%s", host);
-    peer->port = port;
-    peer->ctrl_fd = fd;
-#ifdef HAS_SSL
-    peer->ctrl_ssl = ssl;
-#endif
-    peer->is_inbound = 0;
-    peer->dead = 0;
-    snprintf(peer->cfg_host, sizeof(peer->cfg_host), "%s", host);
-    peer->cfg_port = port;
-    peer->worker_count = g_threads_per_peer;
-
-    create_worker_connections(peer);
-    peer->ready = 1;
-    peer->connected_at = time(NULL);
-
-    char path[PORTAL_MAX_PATH_LEN];
-    snprintf(path, sizeof(path), "/%s/*", peer->name);
-    g_core->path_register(g_core, path, "node");
-    g_core->path_set_access(g_core, path, PORTAL_ACCESS_RW);
-    snprintf(peer->paths[0], NODE_PEER_PATH_LEN, "%.*s",
-                (int)(NODE_PEER_PATH_LEN - 1), path);
-    peer->path_count = 1;
-
-    g_core->fd_add(g_core, fd, EV_READ, on_inbound_data, NULL);
-
-    g_core->log(g_core, PORTAL_LOG_INFO, "node",
-                "Connected to peer '%s' at %s:%d (%d workers)%s",
-                peer->name, host, port, peer->worker_count,
-                ssl ? " [TLS]" : "");
-
-    /* Register indirect peers advertised by this peer (hub discovery) */
-    int hub_idx = (int)(peer - g_peers);
-    for (int rp = 0; rp < remote_peer_count; rp++)
-        register_indirect_peer(remote_peers[rp], hub_idx);
-
-    return 0;
-}
+/* Commit 7: connect_to_peer removed. connect_to_peer_async (Commit 6) is
+ * the sole entry point for establishing outbound peer connections. It
+ * kicks off N+1 parallel non-blocking connect() calls; each fd drives
+ * the TCP→TLS→PORTAL02 handshake through the event loop and attaches
+ * to the peer via finalize_handshake when done. */
 
 /* --- Peer health: mark dead + reconnect --- */
 
 static void mark_peer_dead_by_fd(int fd)
 {
     for (int i = 0; i < g_peer_count; i++) {
-        node_peer_t *p = &g_peers[i];
+        node_peer_t *p = g_peers[i];
         if (p->ctrl_fd == fd ||
             (p->worker_count > 0 && p->workers[0].fd == fd)) {
             if (!p->dead) {
@@ -1212,12 +2373,12 @@ static void mark_peer_dead_by_fd(int fd)
                             "Peer '%s' connection lost", p->name);
                 /* Cascade: indirect peers through this hub are also dead */
                 for (int k = 0; k < g_peer_count; k++) {
-                    if (g_peers[k].is_indirect && g_peers[k].hub_idx == i) {
-                        g_peers[k].dead = 1;
-                        g_peers[k].ready = 0;
+                    if (g_peers[k]->is_indirect && g_peers[k]->hub_idx == i) {
+                        g_peers[k]->dead = 1;
+                        g_peers[k]->ready = 0;
                         g_core->log(g_core, PORTAL_LOG_WARN, "node",
                                     "Indirect peer '%s' lost (hub '%s' down)",
-                                    g_peers[k].name, p->name);
+                                    g_peers[k]->name, p->name);
                     }
                 }
             }
@@ -1268,8 +2429,8 @@ static void connect_configured_peers(void)
         /* Skip if peer exists in any state (avoid duplicates) */
         node_peer_t *existing = find_peer_any(pname);
         if (existing) continue;
-        /* Peer not in list at all — try connecting */
-        connect_to_peer(pname, phost, pport);
+        /* Peer not in list at all — try connecting (Commit 6: async) */
+        connect_to_peer_async(pname, phost, pport);
     }
 }
 
@@ -1281,10 +2442,37 @@ static void reconnect_timer_cb(void *userdata)
     connect_configured_peers();
 }
 
+/* Remove the peer at index `i` from g_peers[]. Frees the peer struct and
+ * shifts the pointer array down. Caller must have already closed fds and
+ * unregistered paths. Also decrements hub_idx of any indirect peers whose
+ * hub was at a higher index. */
+static void peers_remove_at(int i)
+{
+    if (i < 0 || i >= g_peer_count) return;
+    node_peer_t *p = g_peers[i];
+
+    pthread_mutex_destroy(&p->lock);
+    free(p);
+
+    /* Shift the pointer array (O(n), acceptable for infrequent removals) */
+    if (i < g_peer_count - 1) {
+        memmove(&g_peers[i], &g_peers[i + 1],
+                (size_t)(g_peer_count - i - 1) * sizeof(node_peer_t *));
+    }
+    g_peers[g_peer_count - 1] = NULL;
+    g_peer_count--;
+
+    /* Fix up hub_idx of any indirect peer whose hub index is now stale */
+    for (int k = 0; k < g_peer_count; k++) {
+        if (g_peers[k]->is_indirect && g_peers[k]->hub_idx > i)
+            g_peers[k]->hub_idx--;
+    }
+}
+
 static void reconnect_dead_peers(void)
 {
     for (int i = 0; i < g_peer_count; i++) {
-        node_peer_t *p = &g_peers[i];
+        node_peer_t *p = g_peers[i];
         if (p->is_inbound || p->is_indirect || p->cfg_host[0] == '\0') continue;
 
         /* Check if peer needs reconnect:
@@ -1295,35 +2483,51 @@ static void reconnect_dead_peers(void)
         if (!p->dead && !p->ready && p->connected_at > 0 &&
             (time(NULL) - p->connected_at) < 30) continue;  /* give it time */
 
+        /* Commit 6: respect exponential backoff — skip this peer until
+         * next_retry_us has passed. */
+        if (p->next_retry_us > 0 && now_us() < p->next_retry_us)
+            continue;
+
         g_core->log(g_core, PORTAL_LOG_INFO, "node",
                     "Reconnecting '%s' — removing dead peer...", p->name);
 
-        /* Close all fds (no SSL_free — just close raw fds) */
-        if (p->ctrl_fd >= 0) {
-            g_core->fd_del(g_core, p->ctrl_fd);
-            close(p->ctrl_fd);
-        }
+        /* Close all fds (no SSL_free — just close raw fds).
+         * node_fd_del_with_rx frees the rx_state_t registered on each fd.
+         * Workers first, then ctrl_fd, skipping duplicates. */
         for (int j = 0; j < p->worker_count; j++) {
-            if (p->workers[j].fd >= 0) {
-                g_core->fd_del(g_core, p->workers[j].fd);
-                close(p->workers[j].fd);
+            int wfd = p->workers[j].fd;
+            if (wfd >= 0) {
+                node_fd_del_with_rx(wfd);
+                close(wfd);
+                p->workers[j].fd = -1;
+                if (p->ctrl_fd == wfd) {
+                    p->ctrl_fd = -1;
+#ifdef HAS_SSL
+                    p->ctrl_ssl = NULL;
+#endif
+                }
             }
+        }
+        if (p->ctrl_fd >= 0) {
+            node_fd_del_with_rx(p->ctrl_fd);
+            close(p->ctrl_fd);
+            p->ctrl_fd = -1;
         }
         /* Unregister paths */
         for (int j = 0; j < p->path_count; j++)
             g_core->path_unregister(g_core, p->paths[j]);
 
-        /* Remove indirect peers that used this hub (backwards to avoid index shift) */
+        /* Remove indirect peers that used this hub (walk backwards;
+         * peers_remove_at fixes hub_idx shifts for us) */
         for (int k = g_peer_count - 1; k >= 0; k--) {
-            if (g_peers[k].is_indirect && g_peers[k].hub_idx == i) {
+            if (k >= g_peer_count) continue;   /* count changed under us */
+            if (g_peers[k]->is_indirect && g_peers[k]->hub_idx == i) {
                 g_core->log(g_core, PORTAL_LOG_INFO, "node",
-                            "Removing indirect peer '%s'", g_peers[k].name);
-                for (int jp = 0; jp < g_peers[k].path_count; jp++)
-                    g_core->path_unregister(g_core, g_peers[k].paths[jp]);
-                memmove(&g_peers[k], &g_peers[k + 1],
-                        (size_t)(g_peer_count - k - 1) * sizeof(node_peer_t));
-                g_peer_count--;
-                if (k < i) i--;  /* hub index shifted */
+                            "Removing indirect peer '%s'", g_peers[k]->name);
+                for (int jp = 0; jp < g_peers[k]->path_count; jp++)
+                    g_core->path_unregister(g_core, g_peers[k]->paths[jp]);
+                peers_remove_at(k);
+                if (k < i) i--;  /* the hub index shifted down */
             }
         }
 
@@ -1334,14 +2538,79 @@ static void reconnect_dead_peers(void)
         snprintf(save_name, sizeof(save_name), "%s", p->name);
 
         /* Remove peer entry */
-        pthread_mutex_destroy(&p->lock);
-        memmove(p, p + 1, (size_t)(g_peer_count - i - 1) * sizeof(node_peer_t));
-        g_peer_count--;
+        peers_remove_at(i);
         i--;  /* re-check this index */
 
-        /* Fresh connect (creates new peer entry) */
-        connect_to_peer(save_name, save_host, save_port);
+        /* Commit 6: fresh async connect. Respects exponential backoff via
+         * peer->retry_count + next_retry_us, which connect_to_peer_async
+         * resets on success. */
+        (void)save_host; (void)save_port;  /* peer already has cfg_host/cfg_port */
+        connect_to_peer_async(save_name, save_host, save_port);
     }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  Commit 5: handshake timeout sweep
+ *
+ *  Walks g_rx_by_fd once per second. Any fd_state_t whose conn_state is
+ *  not READY and whose state_enter_us is older than the per-state timeout
+ *  is killed cleanly. This protects against peers that accept TCP but
+ *  stall mid-TLS or mid-PORTAL02.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+#define HS_TIMEOUT_TCP_US    (5ULL * 1000000ULL)   /* 5 s for non-blocking connect() */
+#define HS_TIMEOUT_TLS_US    (10ULL * 1000000ULL)  /* 10 s for SSL_do_handshake */
+#define HS_TIMEOUT_EXCHANGE_US (5ULL * 1000000ULL) /* 5 s for PORTAL02 exchange */
+
+typedef struct {
+    int *fds_to_kill;
+    int  count;
+    int  cap;
+    uint64_t now;
+} hs_sweep_ctx_t;
+
+static void hs_sweep_cb(const char *key, void *value, void *userdata)
+{
+    (void)key;
+    rx_state_t *rx = (rx_state_t *)value;
+    hs_sweep_ctx_t *ctx = (hs_sweep_ctx_t *)userdata;
+    if (rx->conn_state == CONN_STATE_READY) return;
+    if (rx->conn_state == CONN_STATE_DEAD) return;
+
+    uint64_t age = ctx->now - rx->state_enter_us;
+    uint64_t limit = HS_TIMEOUT_EXCHANGE_US;
+    if (rx->conn_state == CONN_STATE_TCP_CONNECTING)
+        limit = HS_TIMEOUT_TCP_US;
+    else if (rx->conn_state == CONN_STATE_TLS_ACCEPT ||
+             rx->conn_state == CONN_STATE_TLS_CONNECT)
+        limit = HS_TIMEOUT_TLS_US;
+
+    if (age < limit) return;
+
+    /* Capture the fd — we can't modify the hashtable during iteration */
+    if (ctx->count >= ctx->cap) {
+        int nc = ctx->cap ? ctx->cap * 2 : 16;
+        int *nf = realloc(ctx->fds_to_kill, (size_t)nc * sizeof(int));
+        if (!nf) return;
+        ctx->fds_to_kill = nf;
+        ctx->cap = nc;
+    }
+    ctx->fds_to_kill[ctx->count++] = rx->fd;
+}
+
+static void hs_sweep_timer_cb(void *userdata)
+{
+    (void)userdata;
+    if (!g_rx_ht_inited) return;
+
+    hs_sweep_ctx_t ctx = {0};
+    ctx.now = now_us();
+    portal_ht_iter(&g_rx_by_fd, hs_sweep_cb, &ctx);
+
+    for (int i = 0; i < ctx.count; i++) {
+        hs_abort(ctx.fds_to_kill[i], "handshake timeout");
+    }
+    free(ctx.fds_to_kill);
 }
 
 /* ================================================================
@@ -1351,11 +2620,11 @@ static void reconnect_dead_peers(void)
 int portal_module_load(portal_core_t *core)
 {
     g_core = core;
-    memset(g_peers, 0, sizeof(g_peers));
+    /* Initialize dynamic peer registry (starts with 64 slot capacity) */
+    g_peers = NULL;
+    g_peers_cap = 0;
     g_peer_count = 0;
-#ifdef HAS_SSL
-    memset(g_fd_ssl, 0, sizeof(g_fd_ssl));
-#endif
+    peers_ensure_capacity(64);
 
     const char *name = core->config_get(core, "node", "node_name");
     if (name) snprintf(g_node_name, sizeof(g_node_name), "%s", name);
@@ -1473,7 +2742,8 @@ int portal_module_load(portal_core_t *core)
         return PORTAL_MODULE_FAIL;
     }
 
-    listen(g_listen_fd, 16);
+    listen(g_listen_fd, 128);     /* larger backlog for reconnect storms */
+    set_nonblocking(g_listen_fd);  /* Commit 5: async accept loop */
     core->fd_add(core, g_listen_fd, EV_READ, on_new_peer, NULL);
 
     core->path_register(core, "/node/resources/status", "node");
@@ -1497,6 +2767,8 @@ int portal_module_load(portal_core_t *core)
 
     /* Reconnect timer — direct event loop, no cron dependency */
     core->timer_add(core, NODE_RECONNECT_SEC, reconnect_timer_cb, NULL);
+    /* Commit 5: 1 Hz sweep for stuck handshakes */
+    core->timer_add(core, 1.0, hs_sweep_timer_cb, NULL);
 
 #ifdef HAS_SSL
     /* Daily TLS cert renewal — direct timer, no cron dependency */
@@ -1538,7 +2810,7 @@ int portal_module_load(portal_core_t *core)
         char pname[64] = {0}, phost[256] = {0};
         int pport = NODE_DEFAULT_PORT;
         if (sscanf(val, "%63[^=]=%255[^:]:%d", pname, phost, &pport) >= 2)
-            connect_to_peer(pname, phost, pport);
+            connect_to_peer_async(pname, phost, pport);
     }
 
     return PORTAL_MODULE_OK;
@@ -1547,29 +2819,63 @@ int portal_module_load(portal_core_t *core)
 int portal_module_unload(portal_core_t *core)
 {
     for (int i = 0; i < g_peer_count; i++) {
-        node_peer_t *peer = &g_peers[i];
+        node_peer_t *peer = g_peers[i];
+        /* Close worker fds first, then ctrl_fd — and skip ctrl_fd if it
+         * happens to duplicate a worker (legacy inbound/outbound split).
+         * Zero each fd after close so any stale reference can't re-free. */
         for (int j = 0; j < peer->worker_count; j++) {
-            if (peer->workers[j].fd >= 0) {
+            int wfd = peer->workers[j].fd;
+            if (wfd >= 0) {
 #ifdef HAS_SSL
-                if (peer->workers[j].ssl)
-                    node_ssl_close(peer->workers[j].fd, peer->workers[j].ssl);
+                if (peer->workers[j].ssl) {
+                    node_ssl_close(wfd, peer->workers[j].ssl);
+                    peer->workers[j].ssl = NULL;
+                }
 #endif
-                close(peer->workers[j].fd);
+                node_fd_del_with_rx(wfd);
+                close(wfd);
+                peer->workers[j].fd = -1;
+                /* If ctrl_fd pointed to this same fd, clear it so we
+                 * don't double-free below. */
+                if (peer->ctrl_fd == wfd) {
+                    peer->ctrl_fd = -1;
+#ifdef HAS_SSL
+                    peer->ctrl_ssl = NULL;
+#endif
+                }
             }
         }
         if (peer->ctrl_fd >= 0) {
 #ifdef HAS_SSL
-            if (peer->ctrl_ssl)
+            if (peer->ctrl_ssl) {
                 node_ssl_close(peer->ctrl_fd, peer->ctrl_ssl);
+                peer->ctrl_ssl = NULL;
+            }
 #endif
-            core->fd_del(core, peer->ctrl_fd);
+            node_fd_del_with_rx(peer->ctrl_fd);
             close(peer->ctrl_fd);
+            peer->ctrl_fd = -1;
         }
         for (int j = 0; j < peer->path_count; j++)
             core->path_unregister(core, peer->paths[j]);
         pthread_mutex_destroy(&peer->lock);
+        free(peer);
+        g_peers[i] = NULL;
     }
     g_peer_count = 0;
+    free(g_peers);
+    g_peers = NULL;
+    g_peers_cap = 0;
+
+    /* Destroy the rx_state hashtable (any remaining entries are freed) */
+    if (g_rx_ht_inited) {
+        for (size_t i = 0; i < g_rx_by_fd.capacity; i++) {
+            if (g_rx_by_fd.entries[i].occupied == 1)
+                rx_free(g_rx_by_fd.entries[i].value);
+        }
+        portal_ht_destroy(&g_rx_by_fd);
+        g_rx_ht_inited = 0;
+    }
 
     if (g_listen_fd >= 0) {
         core->fd_del(core, g_listen_fd);
@@ -1590,7 +2896,6 @@ int portal_module_unload(portal_core_t *core)
     core->path_unregister(core, "/node/functions/reload_tls");
     core->path_unregister(core, "/node/functions/renew_tls");
     free_tls_contexts();
-    memset(g_fd_ssl, 0, sizeof(g_fd_ssl));
 #endif
 
     core->log(core, PORTAL_LOG_INFO, "node", "Node module unloaded");
@@ -1630,7 +2935,7 @@ int portal_module_handle(portal_core_t *core, const portal_msg_t *msg,
         size_t off = 0;
         off += (size_t)snprintf(buf + off, sizeof(buf) - off, "Connected peers:\n");
         for (int i = 0; i < g_peer_count; i++) {
-            node_peer_t *p = &g_peers[i];
+            node_peer_t *p = g_peers[i];
             int busy = 0;
             for (int j = 0; j < p->worker_count; j++)
                 if (p->workers[j].busy) busy++;
@@ -1715,7 +3020,7 @@ int portal_module_handle(portal_core_t *core, const portal_msg_t *msg,
             p->ready ? (p->dead ? "dead" : "ready") : "connecting",
             p->is_indirect ? "indirect via " : (p->is_inbound ? "inbound" : "outbound"),
             p->is_indirect && p->hub_idx >= 0 && p->hub_idx < g_peer_count
-                ? g_peers[p->hub_idx].name : "",
+                ? g_peers[p->hub_idx]->name : "",
             "",
             tls_tag,
             p->worker_count, busy,
@@ -1895,7 +3200,7 @@ int portal_module_handle(portal_core_t *core, const portal_msg_t *msg,
         } else {
             /* Ping all peers */
             for (int i = 0; i < g_peer_count; i++) {
-                node_peer_t *p = &g_peers[i];
+                node_peer_t *p = g_peers[i];
                 if (!p->ready || p->dead) continue;
 
                 portal_msg_t ping_msg = {0};
@@ -1970,7 +3275,7 @@ int portal_module_handle(portal_core_t *core, const portal_msg_t *msg,
                         if (p->is_indirect && p->hub_idx >= 0 &&
                             p->hub_idx < g_peer_count) {
                             /* Two hops: local → hub → target */
-                            node_peer_t *hub = &g_peers[p->hub_idx];
+                            node_peer_t *hub = g_peers[p->hub_idx];
 
                             /* Measure hop to hub */
                             portal_msg_t hm = {0};
@@ -2223,21 +3528,17 @@ int portal_module_handle(portal_core_t *core, const portal_msg_t *msg,
                           peer ? peer->ready : 0,
                           peer ? peer->worker_count : 0);
 
-                /* Indirect peer: forward full path through hub */
+                /* Indirect peer: forward full path through hub.
+                 * Commit 4d: uses peer_send_wait (non-blocking tx + FIFO
+                 * pending + nested ev_run). No fd_del/fd_add churn; the
+                 * core thread pumps libev while blocked on the response. */
                 if (peer && peer->ready && peer->is_indirect) {
                     int hi = peer->hub_idx;
                     if (hi >= 0 && hi < g_peer_count &&
-                        g_peers[hi].ready && g_peers[hi].worker_count > 0) {
-                        worker_t *w = get_worker(&g_peers[hi]);
-
-                        /* Send full path including target node prefix —
-                         * the hub will route it to the target node */
-                        portal_msg_t remote_msg = *msg;
-
+                        g_peers[hi]->ready && g_peers[hi]->worker_count > 0) {
                         peer->msgs_sent++;
-                        int rc = worker_send_recv(w, &remote_msg, resp);
-                        release_worker(&g_peers[hi], w);
-
+                        int rc = peer_send_wait(g_peers[hi], msg, resp,
+                                                30ULL * 1000000ULL);
                         if (rc == 0) {
                             peer->msgs_recv++;
                             if (resp->body_len > 0)
@@ -2245,7 +3546,7 @@ int portal_module_handle(portal_core_t *core, const portal_msg_t *msg,
                             core->log(core, PORTAL_LOG_DEBUG, "node",
                                       "Routed %s → %s via hub '%s' [%d]",
                                       msg->path, peer_name,
-                                      g_peers[hi].name, resp->status);
+                                      g_peers[hi]->name, resp->status);
                             return 0;
                         }
                         peer->errors++;
@@ -2254,19 +3555,19 @@ int portal_module_handle(portal_core_t *core, const portal_msg_t *msg,
                     }
                 }
 
-                /* Direct peer: strip node prefix and forward */
+                /* Direct peer: strip node prefix and forward.
+                 * Commit 4d: peer_send_wait drives this non-blocking with
+                 * a FIFO pending queue per conn. The core thread pumps
+                 * libev inside pending_wait while waiting for the response. */
                 if (peer && peer->ready && peer->worker_count > 0) {
-                    worker_t *w = get_worker(peer);
-
                     portal_msg_t remote_msg = *msg;
                     remote_msg.path = (char *)slash;
 
                     peer->msgs_sent++;
                     if (msg->body_len > 0)
                         peer->bytes_sent += msg->body_len;
-                    int rc = worker_send_recv(w, &remote_msg, resp);
-                    release_worker(peer, w);
-
+                    int rc = peer_send_wait(peer, &remote_msg, resp,
+                                             30ULL * 1000000ULL);
                     if (rc == 0) {
                         peer->msgs_recv++;
                         if (resp->body_len > 0)

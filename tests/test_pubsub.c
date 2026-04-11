@@ -14,7 +14,6 @@
  * You should have received a copy of the GNU General Public License
  * along with this program; if not, see <https://www.gnu.org/licenses/>.
  */
-
 /*
  * test_pubsub.c — Unit tests for pub/sub pattern matching (exact, wildcard, global)
  */

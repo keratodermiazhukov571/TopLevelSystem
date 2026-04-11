@@ -14,7 +14,6 @@
   You should have received a copy of the GNU General Public License
   along with this program; if not, see <https://www.gnu.org/licenses/>.
 -->
-
 # Portal Philosophy — Design Rules
 
 These rules govern every decision, every line of code, every module. They are non-negotiable.

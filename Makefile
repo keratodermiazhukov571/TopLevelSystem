@@ -33,7 +33,7 @@ LZMA_LIBS    ?= -llzma
 ZLIB_LIBS    ?= -lz
 
 CFLAGS   = -Wall -Wextra -Werror -std=c11 -D_GNU_SOURCE -Iinclude -Isrc -Ilib/libev -Ilib/sha256
-LDFLAGS  = -ldl -lm -pthread
+LDFLAGS  = -ldl -lm -pthread -rdynamic
 
 # Directories
 SRC_DIR     = src
@@ -130,6 +130,7 @@ TEST_HT      = $(BUILD_DIR)/test_hashtable
 TEST_PUBSUB  = $(BUILD_DIR)/test_pubsub
 TEST_WIRE    = $(BUILD_DIR)/test_wire
 TEST_EVENTS  = $(BUILD_DIR)/test_events
+TEST_EVLOOP  = $(BUILD_DIR)/test_eventloop
 TEST_CRYPTO  = $(BUILD_DIR)/test_crypto
 TEST_VALID   = $(BUILD_DIR)/test_validator
 
@@ -198,7 +199,7 @@ $(MOD_CLI): $(MOD_DIR)/mod_cli/mod_cli.c $(CORE_DIR)/core_message.c
 	@echo "  SO    $@"
 	@$(CC) $(CFLAGS) -shared -fPIC -o $@ $^
 
-$(MOD_NODE): $(MOD_DIR)/mod_node/mod_node.c $(CORE_DIR)/core_message.c $(CORE_DIR)/core_wire.c $(LIB_DIR)/sha256/sha256.c
+$(MOD_NODE): $(MOD_DIR)/mod_node/mod_node.c $(CORE_DIR)/core_message.c $(CORE_DIR)/core_wire.c $(CORE_DIR)/core_hashtable.c $(LIB_DIR)/sha256/sha256.c
 	@echo "  SO    $@"
 ifeq ($(HAS_SSL),yes)
 	@$(CC) $(CFLAGS) -DHAS_SSL -Ilib/sha256 -pthread -shared -fPIC -o $@ $^ $(SSL_LIBS)
@@ -417,7 +418,7 @@ $(PORTALCTL): $(TOOLS_DIR)/portalctl.c
 
 # --- Tests ---
 
-tests: $(TEST_PATH) $(TEST_ACL) $(TEST_HT) $(TEST_PUBSUB) $(TEST_WIRE) $(TEST_EVENTS) $(TEST_CRYPTO) $(TEST_VALID)
+tests: $(TEST_PATH) $(TEST_ACL) $(TEST_HT) $(TEST_PUBSUB) $(TEST_WIRE) $(TEST_EVENTS) $(TEST_EVLOOP) $(TEST_CRYPTO) $(TEST_VALID)
 	@echo ""
 	@echo "Running tests..."
 	@echo "================"
@@ -432,6 +433,8 @@ tests: $(TEST_PATH) $(TEST_ACL) $(TEST_HT) $(TEST_PUBSUB) $(TEST_WIRE) $(TEST_EV
 	@$(TEST_WIRE)
 	@echo ""
 	@$(TEST_EVENTS)
+	@echo ""
+	@$(TEST_EVLOOP)
 	@echo ""
 	@$(TEST_CRYPTO)
 	@echo ""
@@ -451,6 +454,11 @@ $(TEST_EVENTS): $(TESTS_DIR)/test_events.c $(CORE_DIR)/core_events.c $(CORE_DIR)
 	@mkdir -p $(BUILD_DIR)
 	@echo "  CC    $@"
 	@$(CC) $(CFLAGS) -o $@ $^
+
+$(TEST_EVLOOP): $(TESTS_DIR)/test_eventloop.c $(CORE_DIR)/core_event.c $(CORE_DIR)/core_hashtable.c $(CORE_DIR)/core_log.c $(LIBEV_OBJ)
+	@mkdir -p $(BUILD_DIR)
+	@echo "  CC    $@"
+	@$(CC) $(CFLAGS) -Ilib/libev -o $@ $^ -lm
 
 $(TEST_PATH): $(TESTS_DIR)/test_path.c $(CORE_DIR)/core_path.c $(CORE_DIR)/core_message.c $(CORE_DIR)/core_hashtable.c
 	@mkdir -p $(BUILD_DIR)

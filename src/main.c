@@ -1672,15 +1672,19 @@ int main(int argc, char **argv)
     /* Initialize persistent store */
     portal_store_init(&g_instance.store, g_instance.config.data_dir);
 
-    /* Load users: try store first, fall back to legacy users.conf */
+    /* Load users: try store first, fall back to legacy users.conf.
+     * Skip the legacy file silently if it doesn't exist — the store is
+     * authoritative when users/ is present, so the default relative
+     * "./users.conf" path is allowed to be absent without a warning. */
     char users_dir[PORTAL_MAX_PATH_LEN + 32];
     snprintf(users_dir, sizeof(users_dir), "%s/users",
              g_instance.config.data_dir);
     if (access(users_dir, F_OK) == 0) {
         portal_auth_load_from_store(&g_instance.auth, &g_instance.store);
     }
-    /* Also load legacy file (merges any users not in store) */
-    portal_auth_load_users(&g_instance.auth, g_instance.config.users_file);
+    /* Merge any users from the legacy file only if it actually exists */
+    if (access(g_instance.config.users_file, F_OK) == 0)
+        portal_auth_load_users(&g_instance.auth, g_instance.config.users_file);
 
     /* Signals handled by libev inside the event loop */
 #ifndef _WIN32

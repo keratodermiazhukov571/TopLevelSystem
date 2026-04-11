@@ -696,9 +696,9 @@ Two or more Portal instances can connect and share resources over encrypted, aut
 A public node acts as hub, relaying between NAT nodes:
 
 ```
-  ssip841 (NAT) ───TLS───→ devtest (public hub) ←───TLS─── asus (NAT)
+  ssip888 (NAT) ───TLS───→ hub (public)      ←───TLS─── other-peer (NAT)
                                     │
-                     Hub forwards: ssip841 ↔ asus
+                     Hub forwards: ssip888 ↔ other-peer
 ```
 
 NAT nodes connect outbound only. The hub advertises its peers during handshake.

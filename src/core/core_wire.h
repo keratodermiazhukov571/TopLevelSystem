@@ -14,7 +14,6 @@
  * You should have received a copy of the GNU General Public License
  * along with this program; if not, see <https://www.gnu.org/licenses/>.
  */
-
 /*
  * core_wire.h — Binary wire protocol for node-to-node message serialization
  */

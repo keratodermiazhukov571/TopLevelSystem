@@ -268,6 +268,18 @@ static int api_fd_del(portal_core_t *core, int fd)
     return portal_event_del(&inst->events, fd);
 }
 
+static int api_fd_modify(portal_core_t *core, int fd, uint32_t events)
+{
+    portal_instance_t *inst = core->_internal;
+    return portal_event_modify(&inst->events, fd, events);
+}
+
+static void *api_ev_loop_get(portal_core_t *core)
+{
+    portal_instance_t *inst = core->_internal;
+    return inst->events.loop;
+}
+
 static int api_event_register(portal_core_t *core, const char *event_path,
                               const char *description,
                               const portal_labels_t *labels)
@@ -716,6 +728,8 @@ void portal_instance_setup_api(portal_instance_t *inst)
     inst->api.path_iter         = api_path_iter;
     inst->api.fd_add            = api_fd_add;
     inst->api.fd_del            = api_fd_del;
+    inst->api.fd_modify         = api_fd_modify;
+    inst->api.ev_loop_get       = api_ev_loop_get;
     inst->api.config_get        = api_config_get;
     inst->api.log               = api_log;
     inst->api.timer_add         = api_timer_add;
