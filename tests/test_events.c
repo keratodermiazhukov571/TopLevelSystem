@@ -14,6 +14,7 @@
  * You should have received a copy of the GNU General Public License
  * along with this program; if not, see <https://www.gnu.org/licenses/>.
  */
+
 /*
  * test_events.c — Unit tests for Portal event system (register, subscribe, ACL, emit)
  */

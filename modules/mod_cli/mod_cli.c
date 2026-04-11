@@ -207,7 +207,7 @@ static void cmd_help_builtin(int fd, const char *cmd)
             "    Supports full terminal: htop, vi, top, less, sudo.\n"
             "    Type 'exit' to return to Portal CLI.\n\n"
             "    Examples:\n"
-            "      shell ssip841           (remote shell on ssip841 via federation)\n"
+            "      shell ssip888           (remote shell on ssip888 via federation)\n"
             "      shell                   (local shell on this machine)\n\n");
     } else {
         char buf[128];

@@ -45,7 +45,7 @@
 
 ```bash
 # Build
-make                        # Compile core + 51 modules + tools
+make                        # Compile core + 52 modules + tools
 make tests                  # Run 57 unit tests
 make install                # Install to /usr/local/bin + /usr/lib/portal
 
@@ -1259,11 +1259,11 @@ portal/
 │   └── portal-devtest2.service  Devtest2 systemd service
 ├── portal.conf                  Legacy default config (instances use /etc/portal/<name>/)
 ├── users.conf                   Legacy user file (instances use users/ directory)
-├── Makefile                     Build system (51 modules)
+├── Makefile                     Build system (52 modules)
 └── CLAUDE.md                    Project index
 ```
 
-All 95 source files have descriptive header comments.
+All 88 source files have descriptive header comments.
 
 ---
 
@@ -1271,9 +1271,9 @@ All 95 source files have descriptive header comments.
 
 | Metric | Value |
 |--------|-------|
-| **Total C source** | ~28,000 lines across 95 source files |
+| **Total C source** | ~34,000 lines across 88 source files |
 | **Core** | 15 source files, 14 headers (READ-ONLY) |
-| **Modules** | 50 (all with R/W/RW access modes + events) |
+| **Modules** | 52 (all with R/W/RW access modes + events) |
 | **Languages** | 4 (Lua, Python, C, Pascal) |
 | **Unit tests** | 57 across 8 test files |
 | **Interfaces** | 6 (CLI, HTTP, HTTPS, TCP, UDP, SSH) |

@@ -505,15 +505,20 @@ install: all
 	@for mod in $(MOD_ALL); do \
 		install -m 644 $$mod /usr/lib/portal/modules/; \
 	done
-	install -m 644 etc/portal.service /etc/systemd/system/portal.service
 	install -m 644 etc/portal-devtest.service /etc/systemd/system/portal-devtest.service
 	install -m 644 etc/portal-devtest2.service /etc/systemd/system/portal-devtest2.service
+	@# NOTE: etc/portal.service (unnamed "default" unit) is intentionally NOT
+	@# installed. Deployments that run the default instance should install
+	@# their own instance-named unit (e.g. portal-default.service) — see the
+	@# SSIP fleet's portal-default.service for the canonical template.
+	@# Having BOTH portal.service AND portal-default.service enabled would
+	@# spawn two portal processes fighting over the same instance.
 	@# Create default instance if it doesn't exist
 	@test -d /etc/portal/default || $(PREFIX)/bin/portal -C default >/dev/null 2>&1 || true
 	@# Update all instances with missing module configs
 	@$(PREFIX)/bin/portal -U 2>/dev/null || true
 	@echo ""
-	@echo "Installed. 45 modules in /usr/lib/portal/modules/"
+	@echo "Installed. 52 modules in /usr/lib/portal/modules/"
 	@echo ""
 	@echo "  Create instance:  portal -C <name>"
 	@echo "  Delete instance:  portal -D <name>"

@@ -14,6 +14,7 @@
  * You should have received a copy of the GNU General Public License
  * along with this program; if not, see <https://www.gnu.org/licenses/>.
  */
+
 /*
  * test_crypto.c — Unit tests for SHA-256, MD5, Base64, Hex
  *
