@@ -319,14 +319,16 @@ Events are ACL-controlled: subscribers must have labels matching the event's lab
 
 Modules read config from multiple sources (checked in order):
 
-1. **Database** (SQLite/PostgreSQL) — authoritative, survives restarts
-2. **Per-module .conf files** (`modules/mod_mymod.conf` or `modules/core/mod_mymod.conf`)
-3. **portal.conf** sections
+1. **In-memory hash table** — fast O(1) lookup, populated at startup from .conf files
+2. **Database** (SQLite/PostgreSQL) — fallback if key not in memory, authoritative for writes
+3. **Per-module .conf files** — seed the in-memory cache on startup
 
 ```c
-/* Reads from DB first, then .conf files. Section: [mod_mymod] */
+/* Reads from memory first (O(1)), falls back to DB. Section: [mod_mymod] */
 const char *port = core->config_get(core, "mymod", "port");
 ```
+
+Runtime changes via `config set` write to both memory and all storage providers (SQLite, PostgreSQL). The event loop is never blocked by database reads during normal operation.
 
 Config values can be changed at runtime via `/core/config/set` (CLI: `config set mymod port 9090`).
 
@@ -743,11 +745,20 @@ portal> module list
 
 ---
 
-## 13. Remote Shell (mod_shell)
+## 13. Remote Shell
 
-Portal includes a built-in remote shell module that provides SSH-like interactive terminal access to any federated peer.
+Portal provides SSH-like interactive terminal access to any federated peer via dedicated relay threads.
 
-### Stateless Execution
+### Architecture
+
+Two mechanisms serve different use cases:
+
+- **mod_shell** (`/shell/functions/*`) — HTTP/session-based PTY access for web clients and automation
+- **mod_node** (`/node/functions/shell`) — direct fd relay for CLI interactive shells (zero event loop blocking)
+
+The CLI `shell` command uses mod_node for both local and remote shells. Each session gets a **dedicated thread** that relays raw bytes between the CLI client and the PTY — the event loop is never involved in shell I/O.
+
+### Stateless Execution (mod_shell)
 
 ```
 GET /shell/functions/exec?cmd=uptime
@@ -755,27 +766,39 @@ GET /shell/functions/exec?cmd=uptime
 
 Executes a single command via `popen()`. Returns stdout+stderr as body.
 
-### Interactive PTY Sessions
+### Interactive PTY Sessions (mod_shell — for HTTP/API clients)
 
 ```
 PUT /shell/functions/open?rows=24&cols=80  → session_id
 PUT /shell/functions/write?session=<id>    (body: raw bytes)
 PUT /shell/functions/read?session=<id>     → available output
-PUT /shell/functions/close?session=<id>    → closed
+PUT /shell/functions/close?session=<id>    ��� closed
 PUT /shell/functions/resize?session=<id>&rows=40&cols=120
 ```
 
 PTY sessions use `forkpty()` with `TERM=xterm-256color`. Interactive programs (htop, vi, top, less, sudo) work correctly.
 
-### CLI Shell Mode
+### CLI Shell Mode (mod_cli + mod_node — dedicated threads)
 
 ```
-portal:/> shell <peer>
+portal:/> shell              # Local: forkpty() + relay thread
+portal:/> shell <peer>       # Remote: /node/functions/shell + relay thread
 Connected to <peer> (Ctrl-] to disconnect)
 root@remote:~# htop
 ```
 
-Every keystroke goes raw to the remote PTY. Output streams back at 10Hz (100ms). Ctrl-] disconnects. Works bidirectionally between any federated peers.
+**Local shell**: mod_cli forks a PTY directly and spawns a relay thread (PTY output → client fd). Keystrokes go raw to the PTY master fd.
+
+**Remote shell**: mod_node's `/node/functions/shell` acquires a federation worker, sends `/tunnel/shell` to the remote peer (which forks a PTY there), then relays raw bytes between a socketpair and the federation worker fd — all in a background thread. The event loop returns immediately.
+
+Ctrl-] disconnects. Works bidirectionally between any federated peers.
+
+### Federation Shell Path
+
+| Path | Description |
+|------|-------------|
+| `/node/functions/shell` | Open PTY on remote peer. Headers: peer, rows, cols. Returns fd. |
+| `/tunnel/shell` | Internal: remote side forks PTY and relays on worker fd. |
 
 ### Security
 

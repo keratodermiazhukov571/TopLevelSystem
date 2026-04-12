@@ -358,6 +358,28 @@ static void handle_http_request(int fd, http_request_t *req)
     if (req->body_len > 0)
         portal_msg_set_body(msg, req->body, (size_t)req->body_len);
 
+    /* Expose the HTTP peer's IP as a header so modules that care about
+     * rate-limiting, ban tables, or audit logging can key off it. The
+     * underscore prefix avoids colliding with user-supplied headers. */
+    {
+        struct sockaddr_storage peer;
+        socklen_t peer_len = sizeof(peer);
+        char src_ip[46] = "";
+        if (getpeername(fd, (struct sockaddr *)&peer, &peer_len) == 0) {
+            if (peer.ss_family == AF_INET) {
+                inet_ntop(AF_INET,
+                          &((struct sockaddr_in *)&peer)->sin_addr,
+                          src_ip, sizeof(src_ip));
+            } else if (peer.ss_family == AF_INET6) {
+                inet_ntop(AF_INET6,
+                          &((struct sockaddr_in6 *)&peer)->sin6_addr,
+                          src_ip, sizeof(src_ip));
+            }
+        }
+        if (src_ip[0])
+            portal_msg_add_header(msg, "_source_ip", src_ip);
+    }
+
     /* Parse query string as headers: key=value&key2=value2
      * URL-decodes both keys and values (%XX → byte, + → space) */
     if (req->query[0]) {

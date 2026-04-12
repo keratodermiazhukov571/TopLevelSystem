@@ -417,16 +417,18 @@ static const char *api_config_get(portal_core_t *core, const char *module,
 {
     portal_instance_t *inst = core->_internal;
 
-    /* 1. Check database first (authoritative source) */
+    /* 1. Check in-memory hash table first (fast, no I/O) */
+    const char *val = portal_config_get(&inst->config, module, key);
+    if (val) return val;
+
+    /* 2. Fall back to database (slow, only if not in memory) */
     char db_module[128];
     snprintf(db_module, sizeof(db_module), "mod_%s", module);
     if (portal_storage_get_config(&inst->storage, db_module, key,
                                    g_config_buf, sizeof(g_config_buf)) == 0)
         return g_config_buf;
 
-    /* 2. Fall back to in-memory hash table (from .conf files) */
-    const char *val = portal_config_get(&inst->config, module, key);
-    return val;
+    return NULL;
 }
 
 static void api_log(portal_core_t *core, int level, const char *module,

@@ -387,15 +387,25 @@ Before releasing a module:
 
 ## Remote Shell via Federation
 
-Any Portal instance with `mod_shell` loaded provides remote shell access to federated peers:
+Interactive terminal access to any federated peer. Uses real PTY (`forkpty()`) — htop, vi, and all interactive programs work bidirectionally.
 
 ```
-portal:/> shell <peer_name>
+portal:/> shell              # Local shell on this machine
+portal:/> shell <peer_name>  # Remote shell via federation
 Connected to <peer_name> (Ctrl-] to disconnect)
 root@remote:~# 
 ```
 
-This works bidirectionally. A device can shell into the hub, and the hub can shell into any device. Uses real PTY (`forkpty()`) — htop, vi, and all interactive programs work.
+### How It Works
+
+The CLI `shell` command uses **dedicated relay threads** — the event loop is never blocked:
+
+- **Local**: mod_cli forks a PTY directly, spawns a relay thread (PTY ↔ client fd)
+- **Remote**: mod_node opens a federation worker to the peer, sends `/tunnel/shell` (which forks a PTY on the remote side), then relays raw bytes in a background thread (worker fd ↔ socketpair ↔ client fd)
+
+Both paths use the same relay pattern — only the "other end" differs (local PTY fd vs federation worker fd).
+
+mod_shell (`/shell/functions/*`) provides session-based PTY access for HTTP/API clients and automation. The CLI bypasses mod_shell for direct fd relay.
 
 Configuration (`mod_shell.conf`):
 ```ini

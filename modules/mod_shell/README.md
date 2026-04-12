@@ -33,17 +33,26 @@ portal:/>
 
 ## How It Works
 
+mod_shell provides session-based PTY access for HTTP/API clients. The CLI `shell` command uses **dedicated relay threads** via mod_node instead (see below).
+
 - **Real PTY**: `forkpty()` allocates a kernel pseudo-terminal — full ncurses, job control, signals
-- **Raw byte proxy**: every keystroke goes directly to the remote PTY (no local line editing)
-- **10Hz output streaming**: a timer reads PTY output every 100ms and writes to the client
-- **Immediate echo**: each keystroke triggers an instant read after write (sub-ms latency)
+- **Raw byte proxy**: every keystroke goes directly to the PTY (no local line editing)
+- **Dedicated relay threads**: each shell session gets its own thread (no event loop blocking)
 - **Terminal size propagation**: `portal -r` and `portalctl` send `__winsize <rows> <cols>` at connect time
-- **SIGWINCH forwarding**: terminal resize during shell session sends resize to remote PTY in real-time
 - **ANSI passthrough**: escape sequences pass through untouched — full terminal rendering
 - **Clean exit**: terminal reset on disconnect (`\033[?25h\033[0m\033[?1049l\033c`)
-- **Auto-disconnect**: PTY child death detected via `waitpid(WNOHANG)`, triggers clean exit
+- **Auto-disconnect**: PTY child death detected, triggers clean exit
 - **Ctrl-]** (0x1D): disconnect and return to Portal CLI (like telnet)
 - **Bidirectional**: device → hub and hub → device both work via federation
+
+## CLI Shell Architecture
+
+The `shell` command in mod_cli uses a different path than the HTTP API:
+
+- **Local** (`shell`): mod_cli forks PTY directly + spawns relay thread (PTY fd ↔ client fd)
+- **Remote** (`shell <peer>`): mod_node's `/node/functions/shell` acquires a federation worker, sends `/tunnel/shell` to the remote peer (which forks a PTY), then relays in a background thread (worker fd ↔ socketpair ↔ client fd)
+
+This architecture means the event loop is **never blocked** during shell I/O. All bytes flow through dedicated threads, not timers or message polling.
 
 ## Terminal Size
 
@@ -52,9 +61,9 @@ Terminal dimensions are propagated through the full chain:
 1. `portal -r` / `portalctl` detects terminal size via `ioctl(TIOCGWINSZ)`
 2. Sends `__winsize <rows> <cols>` hidden command to mod_cli
 3. mod_cli stores dimensions in client state (`term_rows`, `term_cols`)
-4. On `shell <peer>`, dimensions are sent as `rows`/`cols` headers to `/shell/functions/open`
-5. mod_shell sets PTY size via `ioctl(master_fd, TIOCSWINSZ, &ws)`
-6. On terminal resize (SIGWINCH), new dimensions forwarded via `/shell/functions/resize`
+4. On `shell <peer>`, dimensions are sent as `rows`/`cols` headers
+5. PTY size set via `ioctl(master_fd, TIOCSWINSZ, &ws)` at creation
+6. On terminal resize, `ioctl(TIOCSWINSZ)` updates the local PTY
 
 ## Paths
 
@@ -103,15 +112,16 @@ curl -u root:<pass> -X PUT "http://hub:8090/api/ssip888/shell/functions/exec?cmd
 
 ## CLI Integration
 
-The `shell` command in mod_cli provides the interactive experience:
+The `shell` command in mod_cli provides the interactive experience using dedicated relay threads:
 
 ```
-portal:/> shell              # Local shell on this machine
-portal:/> shell ssip888      # Remote shell via federation
+portal:/> shell              # Local shell (forkpty + relay thread)
+portal:/> shell ssip888      # Remote shell via /node/functions/shell
 portal:/> shell ssip-hub     # Shell into the hub
 ```
 
 Features:
+- Dedicated relay thread per session (never blocks event loop)
 - Raw byte proxy mode (bypasses line editor)
 - Ctrl-] to disconnect cleanly
 - Terminal reset on exit (cursor, colors, alternate screen buffer)

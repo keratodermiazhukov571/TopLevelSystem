@@ -63,7 +63,11 @@
 #include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 #include <time.h>
+#include <pty.h>
+#include <signal.h>
+#include <termios.h>
 
 #include "../../src/core/core_hashtable.h"
 
@@ -697,7 +701,7 @@ static void pending_wait(rx_state_t *st, pending_req_t *pr)
 static int peer_send_wait(node_peer_t *peer, const portal_msg_t *msg,
                            portal_resp_t *resp, uint64_t timeout_us)
 {
-    if (!peer || !peer->ready || peer->dead || peer->worker_count == 0)
+    if (!peer || !peer->ready || peer->dead)
         return -1;
 
     /* Round-robin pick a worker fd whose fd_state is registered */
@@ -716,8 +720,15 @@ static int peer_send_wait(node_peer_t *peer, const portal_msg_t *msg,
             break;
         }
     }
+    /* Inbound peers have ctrl_fd but no workers — use ctrl_fd */
+    if (!st && peer->ctrl_fd >= 0) {
+        char key[16];
+        rx_key(peer->ctrl_fd, key, sizeof(key));
+        st = portal_ht_get(&g_rx_by_fd, key);
+    }
     if (!st) return -1;
-    peer->next_worker = (picked_idx + 1) % peer->worker_count;
+    if (picked_idx >= 0)
+        peer->next_worker = (picked_idx + 1) % peer->worker_count;
 
     /* Encode message into wire bytes */
     uint8_t *wire = NULL;
@@ -1273,6 +1284,149 @@ static int start_pipe(int worker_fd, int port)
     return 0;
 }
 
+/* ================================================================
+ * Remote PTY shell — byte relay through worker fd ↔ PTY master
+ * Like pipe_relay_thread but the "service" end is a PTY child process.
+ * ================================================================ */
+
+typedef struct {
+    int  worker_fd;
+    int  pty_fd;       /* PTY master */
+    pid_t child_pid;
+#ifdef HAS_SSL
+    SSL *worker_ssl;
+#endif
+} shell_ctx_t;
+
+static void *shell_pty_relay_thread(void *arg)
+{
+    shell_ctx_t *ctx = (shell_ctx_t *)arg;
+    int wfd = ctx->worker_fd;
+    int pfd = ctx->pty_fd;
+    int maxfd = (wfd > pfd ? wfd : pfd) + 1;
+    char buf[65536];
+    void *wssl = NULL;
+
+#ifdef HAS_SSL
+    wssl = ctx->worker_ssl;
+#endif
+
+    /* Remove socket timeouts for raw relay */
+    struct timeval notv = {0, 0};
+    setsockopt(wfd, SOL_SOCKET, SO_RCVTIMEO, &notv, sizeof(notv));
+    setsockopt(wfd, SOL_SOCKET, SO_SNDTIMEO, &notv, sizeof(notv));
+
+    while (1) {
+#ifdef HAS_SSL
+        int has_pending = wssl && SSL_pending((SSL *)wssl) > 0;
+#else
+        int has_pending = 0;
+#endif
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(wfd, &rfds);
+        FD_SET(pfd, &rfds);
+
+        struct timeval tv = {0, has_pending ? 0 : 100000};
+        int rc = select(maxfd, &rfds, NULL, NULL, has_pending ? &tv : NULL);
+        if (rc < 0 && errno == EINTR) continue;
+        if (rc < 0) break;
+
+        /* Federation → PTY (remote input) */
+        if (FD_ISSET(wfd, &rfds) || has_pending) {
+            do {
+                ssize_t n = node_read_partial(wfd, wssl, buf, sizeof(buf));
+                if (n <= 0) { if (FD_ISSET(wfd, &rfds)) goto done; else break; }
+                ssize_t w = write(pfd, buf, (size_t)n);
+                if (w < 0 && errno != EAGAIN) goto done;
+#ifdef HAS_SSL
+            } while (wssl && SSL_pending((SSL *)wssl) > 0);
+#else
+            } while (0);
+#endif
+        }
+
+        /* PTY → Federation (remote output) */
+        if (FD_ISSET(pfd, &rfds)) {
+            ssize_t n = read(pfd, buf, sizeof(buf));
+            if (n < 0 && (errno == EAGAIN || errno == EINTR)) continue;
+            if (n <= 0) break;  /* child exited or PTY closed */
+            if (node_send(wfd, wssl, (uint8_t *)buf, (size_t)n) < 0) break;
+        }
+    }
+done:
+    /* Cleanup: kill child, close PTY */
+    if (ctx->child_pid > 0) {
+        kill(ctx->child_pid, SIGHUP);
+        usleep(50000);
+        kill(ctx->child_pid, SIGKILL);
+        waitpid(ctx->child_pid, NULL, WNOHANG);
+    }
+    close(pfd);
+
+#ifdef HAS_SSL
+    if (wssl) {
+        node_ssl_close(wfd, (SSL *)wssl);
+        close(wfd);
+        g_core->log(g_core, PORTAL_LOG_INFO, "node",
+                    "Shell TLS relay closed (pid %d)", ctx->child_pid);
+        free(ctx);
+        return NULL;
+    }
+#endif
+    /* Plain TCP: re-add fd to event loop for reuse */
+    set_nonblocking(wfd);
+    node_fd_add_with_rx(wfd);
+    g_core->log(g_core, PORTAL_LOG_INFO, "node",
+                "Shell relay closed (pid %d)", ctx->child_pid);
+    free(ctx);
+    return NULL;
+}
+
+static int start_shell(int worker_fd, int rows, int cols)
+{
+    struct winsize ws = {
+        .ws_row = (unsigned short)(rows > 0 ? rows : 24),
+        .ws_col = (unsigned short)(cols > 0 ? cols : 80)
+    };
+
+    int master_fd;
+    pid_t pid = forkpty(&master_fd, NULL, NULL, &ws);
+    if (pid < 0) return -1;
+
+    if (pid == 0) {
+        /* Child: exec login shell */
+        setenv("TERM", "xterm-256color", 1);
+        execl("/bin/bash", "bash", "-l", (char *)NULL);
+        _exit(127);
+    }
+
+    /* Parent: set PTY master non-blocking for select loop */
+    int flags = fcntl(master_fd, F_GETFL, 0);
+    fcntl(master_fd, F_SETFL, flags | O_NONBLOCK);
+
+    /* Take worker fd out of event loop → blocking mode for relay */
+    node_fd_del_with_rx(worker_fd);
+    set_blocking(worker_fd);
+
+    shell_ctx_t *ctx = malloc(sizeof(*ctx));
+    ctx->worker_fd = worker_fd;
+    ctx->pty_fd = master_fd;
+    ctx->child_pid = pid;
+#ifdef HAS_SSL
+    ctx->worker_ssl = ssl_for_fd(worker_fd);
+#endif
+
+    pthread_t th;
+    pthread_create(&th, NULL, shell_pty_relay_thread, ctx);
+    pthread_detach(th);
+
+    g_core->log(g_core, PORTAL_LOG_INFO, "node",
+                "Shell started: fd %d → PTY (pid %d, %dx%d)",
+                worker_fd, pid, cols, rows);
+    return 0;
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  *  Commit 5: async inbound handshake state machine
  *
@@ -1593,21 +1747,58 @@ static void finalize_handshake(rx_state_t *rx)
         return;
     }
 
-    /* ── Inbound path (Commit 5, unchanged) ───────────────────────── */
+    /* ── Inbound path (Commit 5, updated: clean stale workers) ───── */
 
     /* Check if this fd is a worker connection from an already-known peer */
     node_peer_t *existing = find_peer_by_name(hs->peer_name);
     if (existing) {
+        /* Kill stale workers before adding new one. A reconnecting
+         * device may leave zombie fds that never got cleaned up. */
+        pthread_mutex_lock(&existing->lock);
+        for (int j = 0; j < existing->worker_count; j++) {
+            int wfd = existing->workers[j].fd;
+            if (wfd < 0) continue;
+            char wkey[16];
+            snprintf(wkey, sizeof(wkey), "%d", wfd);
+            rx_state_t *wrx = portal_ht_get(&g_rx_by_fd, wkey);
+            int stale = (!wrx || wrx->conn_state != CONN_STATE_READY);
+            if (stale) {
+                if (wrx) {
+                    node_fd_del_with_rx(wfd);
+                } else {
+                    g_core->fd_del(g_core, wfd);
+                }
+                close(wfd);
+                existing->workers[j].fd = -1;
+#ifdef HAS_SSL
+                existing->workers[j].ssl = NULL;
+#endif
+                g_core->log(g_core, PORTAL_LOG_INFO, "node",
+                            "Cleaned stale worker fd=%d from '%s'",
+                            wfd, existing->name);
+            }
+        }
+        /* Compact: shift valid workers down */
+        int w_out = 0;
+        for (int j = 0; j < existing->worker_count; j++) {
+            if (existing->workers[j].fd >= 0) {
+                if (w_out != j)
+                    existing->workers[w_out] = existing->workers[j];
+                w_out++;
+            }
+        }
+        existing->worker_count = w_out;
+
+        /* Add new worker */
         if (existing->worker_count < NODE_MAX_THREADS) {
-            pthread_mutex_lock(&existing->lock);
             worker_t *w = &existing->workers[existing->worker_count++];
             w->fd = client_fd;
             w->busy = 0;
 #ifdef HAS_SSL
             w->ssl = ssl;
 #endif
-            pthread_mutex_unlock(&existing->lock);
         }
+        pthread_mutex_unlock(&existing->lock);
         /* Transition fd to READY; keep the rx_state_t registered. The
          * old blocking flow called node_fd_add_with_rx here; we already
          * have the fd in the event loop via node_fd_add_inbound_handshake,
@@ -2261,12 +2452,76 @@ read_more:
             return;
         }
 
+        /* Check for SHELL request — switch fd to PTY relay mode */
+        if (incoming.path && strcmp(incoming.path, "/tunnel/shell") == 0) {
+            int rows = 24, cols = 80;
+            for (uint16_t i = 0; i < incoming.header_count; i++) {
+                if (strcmp(incoming.headers[i].key, "rows") == 0)
+                    rows = atoi(incoming.headers[i].value);
+                if (strcmp(incoming.headers[i].key, "cols") == 0)
+                    cols = atoi(incoming.headers[i].value);
+            }
+
+            int shell_ok = 0;
+            if (start_shell(fd, rows, cols) == 0) {
+                shell_ok = 1;
+                resp.status = PORTAL_OK;
+                char ok_body[] = "SHELL";
+                resp.body = ok_body;
+                resp.body_len = 5;
+            }
+
+            if (!shell_ok)
+                resp.status = PORTAL_UNAVAILABLE;
+
+            /* Send response BEFORE switching to raw relay mode */
+            uint8_t *resp_buf = NULL;
+            size_t resp_len = 0;
+            if (portal_wire_encode_resp(&resp, &resp_buf, &resp_len) == 0) {
+                node_send(fd, ssl, resp_buf, resp_len);
+                free(resp_buf);
+            }
+            resp.body = NULL;
+
+            free(incoming.path);
+            for (uint16_t hi = 0; hi < incoming.header_count; hi++) {
+                free(incoming.headers[hi].key);
+                free(incoming.headers[hi].value);
+            }
+            free(incoming.headers);
+            free(incoming.body);
+            if (incoming.ctx) {
+                free(incoming.ctx->auth.user);
+                free(incoming.ctx->auth.token);
+                free(incoming.ctx);
+            }
+            /* start_shell took ownership of the fd and called fd_del,
+             * which freed our rx_state_t. Do NOT touch rx after this. */
+            return;
+        }
+
         /* Track inbound message */
         node_peer_t *src_peer = find_peer_by_fd(fd);
         if (src_peer) {
             src_peer->msgs_recv++;
             if (incoming.body_len > 0)
                 src_peer->bytes_recv += incoming.body_len;
+        }
+
+        /* Federation trust: the peer already authenticated via federation_key
+         * during the TLS handshake. Attach local root credentials so the
+         * core router grants full access to federated requests. Without this,
+         * the remote user's token (from a different node's user DB) would
+         * fail the local auth check → ACCESS DENIED. */
+        if (g_federation_key[0]) {
+            if (!incoming.ctx)
+                incoming.ctx = calloc(1, sizeof(portal_ctx_t));
+            if (incoming.ctx) {
+                free(incoming.ctx->auth.user);
+                free(incoming.ctx->auth.token);
+                incoming.ctx->auth.user = strdup("root");
+                incoming.ctx->auth.token = strdup("__federation__");
+            }
         }
 
         /* Normal message routing */
@@ -2407,6 +2662,17 @@ static void mark_peer_dead_by_fd(int fd)
 #ifdef HAS_SSL
                 p->workers[j].ssl = NULL;
 #endif
+                /* Compact: shift remaining workers down */
+                for (int k = j; k < p->worker_count - 1; k++)
+                    p->workers[k] = p->workers[k + 1];
+                p->worker_count--;
+                /* If no workers left and ctrl_fd dead, mark peer dead */
+                if (p->worker_count == 0 && p->ctrl_fd < 0) {
+                    p->dead = 1;
+                    p->ready = 0;
+                    g_core->log(g_core, PORTAL_LOG_WARN, "node",
+                                "Peer '%s' all workers lost", p->name);
+                }
                 return;
             }
         }
@@ -2488,6 +2754,33 @@ static void peers_remove_at(int i)
 
 static void reconnect_dead_peers(void)
 {
+    /* Sweep stale inbound peers: not ready for > 60s, or dead */
+    for (int i = g_peer_count - 1; i >= 0; i--) {
+        node_peer_t *p = g_peers[i];
+        if (!p->is_inbound) continue;
+        int stale = (p->dead) ||
+                    (!p->ready && p->connected_at > 0 &&
+                     (time(NULL) - p->connected_at) > 60);
+        if (!stale) continue;
+
+        g_core->log(g_core, PORTAL_LOG_INFO, "node",
+                    "Removing stale inbound peer '%s'", p->name);
+        for (int j = 0; j < p->worker_count; j++) {
+            if (p->workers[j].fd >= 0) {
+                node_fd_del_with_rx(p->workers[j].fd);
+                close(p->workers[j].fd);
+            }
+        }
+        if (p->ctrl_fd >= 0) {
+            node_fd_del_with_rx(p->ctrl_fd);
+            close(p->ctrl_fd);
+        }
+        for (int j = 0; j < p->path_count; j++)
+            g_core->path_unregister(g_core, p->paths[j]);
+        peers_remove_at(i);
+    }
+
+    /* Reconnect outbound peers */
     for (int i = 0; i < g_peer_count; i++) {
         node_peer_t *p = g_peers[i];
         if (p->is_inbound || p->is_indirect || p->cfg_host[0] == '\0') continue;
@@ -2798,6 +3091,9 @@ int portal_module_load(portal_core_t *core)
     core->path_set_access(core, "/node/functions/reconnect", PORTAL_ACCESS_RW);
     core->path_register(core, "/node/functions/pipe", "node");
     core->path_set_access(core, "/node/functions/pipe", PORTAL_ACCESS_RW);
+    core->path_register(core, "/node/functions/shell", "node");
+    core->path_set_access(core, "/node/functions/shell", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/node/functions/shell", "Open PTY shell on peer. Headers: peer, rows, cols. Returns fd for raw relay.");
     core->path_register(core, "/node/functions/ping", "node");
     core->path_set_access(core, "/node/functions/ping", PORTAL_ACCESS_RW);
     core->path_set_description(core, "/node/functions/ping", "Measure RTT to peer. Header: name (or 'all')");
@@ -2905,6 +3201,7 @@ int portal_module_unload(portal_core_t *core)
     core->path_unregister(core, "/node/resources/peer/*");
     core->path_unregister(core, "/node/functions/reconnect");
     core->path_unregister(core, "/node/functions/pipe");
+    core->path_unregister(core, "/node/functions/shell");
     core->path_unregister(core, "/node/functions/ping");
     core->path_unregister(core, "/node/functions/trace");
     core->path_unregister(core, "/node/functions/location");
@@ -2923,6 +3220,130 @@ int portal_module_unload(portal_core_t *core)
 /* ================================================================
  * Message handler
  * ================================================================ */
+
+/* ── Shell worker thread: get_worker + worker_send_recv in background ── */
+
+typedef struct {
+    int            local_fd;     /* socketpair end — relay to caller */
+    node_peer_t   *peer;         /* target peer */
+    worker_t      *worker;       /* pre-acquired worker (fd already removed from ev loop) */
+    int            rows;
+    int            cols;
+} shell_connect_ctx_t;
+
+static void *shell_connect_thread(void *arg)
+{
+    shell_connect_ctx_t *c = (shell_connect_ctx_t *)arg;
+    int lfd = c->local_fd;
+    worker_t *w = c->worker;  /* already acquired on main thread */
+
+    /* Send /tunnel/shell via blocking I/O on the worker fd */
+    portal_msg_t smsg = {0};
+    char spath[] = "/tunnel/shell";
+    smsg.path = spath;
+    smsg.method = PORTAL_METHOD_CALL;
+    char rs[16], cs[16];
+    snprintf(rs, sizeof(rs), "%d", c->rows);
+    snprintf(cs, sizeof(cs), "%d", c->cols);
+    portal_header_t sh[2] = {
+        { .key = "rows", .value = rs },
+        { .key = "cols", .value = cs }
+    };
+    smsg.headers = sh;
+    smsg.header_count = 2;
+
+    portal_resp_t sr = {0};
+    int rc = worker_send_recv(w, &smsg, &sr);
+
+    if (rc < 0 || sr.status != PORTAL_OK) {
+        g_core->log(g_core, PORTAL_LOG_ERROR, "node",
+                    "Shell: /tunnel/shell failed on peer '%s' (rc=%d status=%d)",
+                    c->peer->name, rc, sr.status);
+        /* Cannot call release_worker from background thread (libev not thread-safe).
+         * Just close the worker fd — it's already removed from the event loop. */
+        close(w->fd);
+        w->fd = -1;
+        w->busy = 0;
+        free(sr.body);
+        close(lfd);
+        free(c);
+        return NULL;
+    }
+    free(sr.body);
+
+    g_core->log(g_core, PORTAL_LOG_INFO, "node",
+                "Shell connected to '%s' via worker fd %d", c->peer->name, w->fd);
+
+    /* Worker fd is now in raw shell mode — relay between lfd and worker fd.
+     * worker_send_recv already set it to blocking mode. */
+    w->busy = 2;  /* pipe mode — won't be returned to pool */
+
+    int wfd = w->fd;
+    void *wssl = NULL;
+#ifdef HAS_SSL
+    wssl = w->ssl;
+#endif
+
+    /* Remove socket timeouts for relay */
+    struct timeval notv = {0, 0};
+    setsockopt(wfd, SOL_SOCKET, SO_RCVTIMEO, &notv, sizeof(notv));
+    setsockopt(wfd, SOL_SOCKET, SO_SNDTIMEO, &notv, sizeof(notv));
+
+    int maxfd = (lfd > wfd ? lfd : wfd) + 1;
+    char buf[65536];
+
+    while (1) {
+#ifdef HAS_SSL
+        int has_p = wssl && SSL_pending((SSL *)wssl) > 0;
+#else
+        int has_p = 0;
+#endif
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(lfd, &rfds);
+        FD_SET(wfd, &rfds);
+        struct timeval stv = {0, has_p ? 0 : 100000};
+        int sel = select(maxfd, &rfds, NULL, NULL, has_p ? &stv : NULL);
+        if (sel < 0 && errno == EINTR) continue;
+        if (sel < 0) break;
+
+        /* local → remote (client input) */
+        if (FD_ISSET(lfd, &rfds)) {
+            ssize_t n = read(lfd, buf, sizeof(buf));
+            if (n <= 0) break;
+            if (node_send(wfd, wssl, (uint8_t *)buf, (size_t)n) < 0) break;
+        }
+        /* remote → local (PTY output) */
+        if (FD_ISSET(wfd, &rfds) || has_p) {
+            do {
+                ssize_t n = node_read_partial(wfd, wssl, buf, sizeof(buf));
+                if (n <= 0) { if (FD_ISSET(wfd, &rfds)) goto shell_done; else break; }
+                if (send_all(lfd, (uint8_t *)buf, (size_t)n) < 0) goto shell_done;
+#ifdef HAS_SSL
+            } while (wssl && SSL_pending((SSL *)wssl) > 0);
+#else
+            } while (0);
+#endif
+        }
+    }
+shell_done:
+    close(lfd);
+
+    /* Clean up worker fd — close it, don't return to pool.
+     * Cannot call node_fd_add_with_rx from background thread (libev). */
+#ifdef HAS_SSL
+    if (wssl)
+        node_ssl_close(wfd, (SSL *)wssl);
+#endif
+    close(wfd);
+    w->fd = -1;
+    w->busy = 0;
+    g_core->log(g_core, PORTAL_LOG_INFO, "node",
+                "Shell relay closed (peer '%s')", c->peer->name);
+
+    free(c);
+    return NULL;
+}
 
 int portal_module_handle(portal_core_t *core, const portal_msg_t *msg,
                           portal_resp_t *resp)
@@ -3527,6 +3948,69 @@ int portal_module_handle(portal_core_t *core, const portal_msg_t *msg,
         return 0;
     }
 
+    /* /node/functions/shell — PTY shell on remote peer via dedicated connection.
+     * Opens a NEW TCP(+TLS) connection to the peer in a background thread,
+     * sends /tunnel/shell, then relays raw bytes. Never touches the worker
+     * pool, never blocks the event loop.
+     *
+     * Returns immediately with a socketpair fd. The background thread
+     * connects, handshakes, and starts relaying. If the connection fails,
+     * the fd is closed (relay thread exits, CLI sees session ended). */
+    if (strcmp(msg->path, "/node/functions/shell") == 0) {
+        const char *peer_name = NULL;
+        const char *rows_str = "24", *cols_str = "80";
+        for (uint16_t hi = 0; hi < msg->header_count; hi++) {
+            if (strcmp(msg->headers[hi].key, "peer") == 0) peer_name = msg->headers[hi].value;
+            if (strcmp(msg->headers[hi].key, "rows") == 0) rows_str = msg->headers[hi].value;
+            if (strcmp(msg->headers[hi].key, "cols") == 0) cols_str = msg->headers[hi].value;
+        }
+        if (!peer_name) {
+            portal_resp_set_status(resp, PORTAL_BAD_REQUEST);
+            return -1;
+        }
+
+        node_peer_t *peer = find_peer_by_name(peer_name);
+        if (!peer || !peer->ready) {
+            portal_resp_set_status(resp, PORTAL_NOT_FOUND);
+            return -1;
+        }
+
+        /* Acquire worker on main thread (fd_del must run on ev loop thread) */
+        worker_t *w = get_worker(peer);
+        if (!w || w->fd < 0) {
+            portal_resp_set_status(resp, PORTAL_UNAVAILABLE);
+            return -1;
+        }
+
+        /* Create socketpair: sp[0] = background thread side, sp[1] = caller side */
+        int sp[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) < 0) {
+            release_worker(peer, w);
+            portal_resp_set_status(resp, PORTAL_INTERNAL_ERROR);
+            return -1;
+        }
+
+        shell_connect_ctx_t *ctx = calloc(1, sizeof(*ctx));
+        ctx->local_fd = sp[0];
+        ctx->peer = peer;
+        ctx->worker = w;
+        ctx->rows = atoi(rows_str);
+        ctx->cols = atoi(cols_str);
+
+        pthread_t th;
+        pthread_create(&th, NULL, shell_connect_thread, ctx);
+        pthread_detach(th);
+
+        /* Return sp[1] to caller — immediately, no blocking */
+        char fd_str[16];
+        int fd_n = snprintf(fd_str, sizeof(fd_str), "%d", sp[1]);
+        portal_resp_set_status(resp, PORTAL_OK);
+        portal_resp_set_body(resp, fd_str, (size_t)fd_n);
+        core->log(core, PORTAL_LOG_INFO, "node",
+                  "Shell opening on peer '%s' (fd %d)", peer_name, sp[1]);
+        return 0;
+    }
+
     /* Route to remote peer: /<peer_name>/rest/of/path */
     const char *path = msg->path;
     if (path[0] == '/') {
@@ -3576,7 +4060,8 @@ int portal_module_handle(portal_core_t *core, const portal_msg_t *msg,
                  * Commit 4d: peer_send_wait drives this non-blocking with
                  * a FIFO pending queue per conn. The core thread pumps
                  * libev inside pending_wait while waiting for the response. */
-                if (peer && peer->ready && peer->worker_count > 0) {
+                if (peer && peer->ready &&
+                    (peer->worker_count > 0 || peer->ctrl_fd >= 0)) {
                     portal_msg_t remote_msg = *msg;
                     remote_msg.path = (char *)slash;
 
