@@ -3700,6 +3700,7 @@ static void *shell_indirect_thread(void *arg)
         char rpath[256], wpath[256];
         snprintf(rpath, sizeof(rpath), "/%s/shell/functions/read", c->target);
         snprintf(wpath, sizeof(wpath), "/%s/shell/functions/write", c->target);
+        int empty_reads = 0;  /* consecutive empty reads → session dead */
 
         while (1) {
             /* Check for input from CLI client (non-blocking) */
@@ -3751,6 +3752,16 @@ static void *shell_indirect_thread(void *arg)
                     if (rr->body && rr->body_len > 0) {
                         ssize_t w = send(lfd, rr->body, rr->body_len, MSG_NOSIGNAL);
                         if (w < 0) { portal_msg_free(rm); portal_resp_free(rr); break; }
+                        empty_reads = 0;
+                    } else {
+                        /* No data — child may have exited but session not yet
+                         * cleaned up. After 2s of silence (40 × 50ms), assume
+                         * the session is dead. */
+                        empty_reads++;
+                        if (empty_reads > 40) {
+                            portal_msg_free(rm); portal_resp_free(rr);
+                            break;
+                        }
                     }
                     portal_msg_free(rm); portal_resp_free(rr);
                 }
