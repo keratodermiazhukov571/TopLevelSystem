@@ -2118,6 +2118,209 @@ static int discover_subnet(portal_core_t *core, const char *subnet,
 }
 
 /* ================================================================
+ * CLI command handlers (registered via portal_cli_register)
+ * ================================================================ */
+
+static void cli_send(int fd, const char *s)
+{
+    if (s) write(fd, s, strlen(s));
+}
+
+static void cli_get_path(int fd, const char *path)
+{
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (!m || !r) return;
+    portal_msg_set_path(m, path);
+    portal_msg_set_method(m, PORTAL_METHOD_GET);
+    g_core->send(g_core, m, r);
+    if (r->body) write(fd, r->body, r->body_len);
+    portal_msg_free(m); portal_resp_free(r);
+}
+
+static int cli_iot_devices(portal_core_t *core, int fd,
+                            const char *line, const char *args)
+{
+    (void)core; (void)line; (void)args;
+    cli_get_path(fd, "/iot/resources/devices");
+    return 0;
+}
+
+static int cli_iot_status(portal_core_t *core, int fd,
+                           const char *line, const char *args)
+{
+    (void)line;
+    if (args && *args) {
+        portal_msg_t *m = portal_msg_alloc();
+        portal_resp_t *r = portal_resp_alloc();
+        if (m && r) {
+            portal_msg_set_path(m, "/iot/functions/status");
+            portal_msg_set_method(m, PORTAL_METHOD_GET);
+            portal_msg_add_header(m, "name", args);
+            core->send(core, m, r);
+            if (r->body) cli_send(fd, r->body);
+            else cli_send(fd, "(no response)\n");
+            portal_msg_free(m); portal_resp_free(r);
+        }
+    } else {
+        cli_get_path(fd, "/iot/functions/status");
+    }
+    return 0;
+}
+
+static int cli_iot_discover(portal_core_t *core, int fd,
+                             const char *line, const char *args)
+{
+    (void)line;
+    if (!args || !*args) { cli_send(fd, "Usage: iot discover <subnet> [brand]\n"); return -1; }
+    char subnet[48] = {0}, brand[32] = {0};
+    sscanf(args, "%47s %31s", subnet, brand);
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (m && r) {
+        portal_msg_set_path(m, "/iot/functions/discover");
+        portal_msg_set_method(m, PORTAL_METHOD_CALL);
+        portal_msg_add_header(m, "subnet", subnet);
+        if (brand[0]) portal_msg_add_header(m, "brand", brand);
+        core->send(core, m, r);
+        if (r->body) cli_send(fd, r->body);
+        else cli_send(fd, "(no response)\n");
+        portal_msg_free(m); portal_resp_free(r);
+    }
+    return 0;
+}
+
+static int cli_iot_on(portal_core_t *core, int fd,
+                       const char *line, const char *args)
+{
+    (void)line;
+    if (!args || !*args) { cli_send(fd, "Usage: iot on <name>\n"); return -1; }
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (m && r) {
+        portal_msg_set_path(m, "/iot/functions/on");
+        portal_msg_set_method(m, PORTAL_METHOD_CALL);
+        portal_msg_add_header(m, "name", args);
+        core->send(core, m, r);
+        cli_send(fd, r->body ? r->body : "OK\n");
+        portal_msg_free(m); portal_resp_free(r);
+    }
+    return 0;
+}
+
+static int cli_iot_off(portal_core_t *core, int fd,
+                        const char *line, const char *args)
+{
+    (void)line;
+    if (!args || !*args) { cli_send(fd, "Usage: iot off <name>\n"); return -1; }
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (m && r) {
+        portal_msg_set_path(m, "/iot/functions/off");
+        portal_msg_set_method(m, PORTAL_METHOD_CALL);
+        portal_msg_add_header(m, "name", args);
+        core->send(core, m, r);
+        cli_send(fd, r->body ? r->body : "OK\n");
+        portal_msg_free(m); portal_resp_free(r);
+    }
+    return 0;
+}
+
+static int cli_iot_toggle(portal_core_t *core, int fd,
+                           const char *line, const char *args)
+{
+    (void)line;
+    if (!args || !*args) { cli_send(fd, "Usage: iot toggle <name>\n"); return -1; }
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (m && r) {
+        portal_msg_set_path(m, "/iot/functions/toggle");
+        portal_msg_set_method(m, PORTAL_METHOD_CALL);
+        portal_msg_add_header(m, "name", args);
+        core->send(core, m, r);
+        cli_send(fd, r->body ? r->body : "OK\n");
+        portal_msg_free(m); portal_resp_free(r);
+    }
+    return 0;
+}
+
+static int cli_iot_add(portal_core_t *core, int fd,
+                        const char *line, const char *args)
+{
+    (void)line;
+    char name[64] = {0}, ip[48] = {0}, drv[16] = {0}, brn[16] = {0};
+    int parsed = args ? sscanf(args, "%63s %47s %15s %15s", name, ip, drv, brn) : 0;
+    if (parsed < 2) {
+        cli_send(fd, "Usage: iot add <name> <ip> [driver] [brand]\n");
+        return -1;
+    }
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (m && r) {
+        portal_msg_set_path(m, "/iot/functions/add");
+        portal_msg_set_method(m, PORTAL_METHOD_CALL);
+        portal_msg_add_header(m, "name", name);
+        portal_msg_add_header(m, "ip", ip);
+        if (drv[0]) portal_msg_add_header(m, "driver", drv);
+        if (brn[0]) portal_msg_add_header(m, "brand", brn);
+        core->send(core, m, r);
+        cli_send(fd, r->body ? r->body : "OK\n");
+        portal_msg_free(m); portal_resp_free(r);
+    }
+    return 0;
+}
+
+static int cli_iot_remove(portal_core_t *core, int fd,
+                           const char *line, const char *args)
+{
+    (void)line;
+    if (!args || !*args) { cli_send(fd, "Usage: iot remove <name>\n"); return -1; }
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (m && r) {
+        portal_msg_set_path(m, "/iot/functions/remove");
+        portal_msg_set_method(m, PORTAL_METHOD_CALL);
+        portal_msg_add_header(m, "name", args);
+        core->send(core, m, r);
+        cli_send(fd, r->body ? r->body : "OK\n");
+        portal_msg_free(m); portal_resp_free(r);
+    }
+    return 0;
+}
+
+static int cli_iot_refresh(portal_core_t *core, int fd,
+                            const char *line, const char *args)
+{
+    (void)line; (void)args;
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (m && r) {
+        portal_msg_set_path(m, "/iot/functions/refresh");
+        portal_msg_set_method(m, PORTAL_METHOD_CALL);
+        core->send(core, m, r);
+        if (r->body)
+            write(fd, r->body, r->body_len > 0 ? r->body_len : strlen(r->body));
+        else
+            cli_send(fd, "(refresh failed)\n");
+        portal_msg_free(m); portal_resp_free(r);
+    }
+    return 0;
+}
+
+static portal_cli_entry_t iot_cli_cmds[] = {
+    { .words = "iot devices",  .handler = cli_iot_devices,  .summary = "List all IoT devices" },
+    { .words = "iot status",   .handler = cli_iot_status,   .summary = "IoT device status [name]" },
+    { .words = "iot discover", .handler = cli_iot_discover, .summary = "Discover IoT devices on subnet" },
+    { .words = "iot on",       .handler = cli_iot_on,       .summary = "Turn IoT device on" },
+    { .words = "iot off",      .handler = cli_iot_off,      .summary = "Turn IoT device off" },
+    { .words = "iot toggle",   .handler = cli_iot_toggle,   .summary = "Toggle IoT device state" },
+    { .words = "iot add",      .handler = cli_iot_add,      .summary = "Add IoT device manually" },
+    { .words = "iot remove",   .handler = cli_iot_remove,   .summary = "Remove IoT device" },
+    { .words = "iot refresh",  .handler = cli_iot_refresh,  .summary = "Refresh all IoT device states" },
+    { .words = NULL }
+};
+
+/* ================================================================
  * Module lifecycle
  * ================================================================ */
 
@@ -2189,6 +2392,10 @@ int portal_module_load(portal_core_t *core)
     /* Load saved devices from config files */
     int loaded = devices_load_all(core);
 
+    /* Register CLI commands */
+    for (int i = 0; iot_cli_cmds[i].words; i++)
+        portal_cli_register(core, &iot_cli_cmds[i], "iot");
+
     core->log(core, PORTAL_LOG_INFO, "iot",
               "IoT manager ready (max: %d, loaded: %d, poll: %ds, tapo: %s, dir: %s)",
               g_max, loaded, g_poll_interval,
@@ -2212,6 +2419,7 @@ int portal_module_unload(portal_core_t *core)
     core->path_unregister(core, "/iot/functions/vacuum");
     core->path_unregister(core, "/iot/functions/bulb");
     core->path_unregister(core, "/iot/functions/refresh");
+    portal_cli_unregister_module(core, "iot");
     core->log(core, PORTAL_LOG_INFO, "iot", "IoT manager unloaded");
     g_core = NULL;
     return PORTAL_MODULE_OK;

@@ -32,6 +32,7 @@
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <unistd.h>
 #include "portal/portal.h"
 
 static portal_core_t *g_core = NULL;
@@ -53,6 +54,65 @@ static const char *get_hdr(const portal_msg_t *msg, const char *key)
     return NULL;
 }
 
+/* ── CLI command handlers (registered via portal_cli_register) ── */
+
+static void cli_send(int fd, const char *s)
+{
+    if (s) write(fd, s, strlen(s));
+}
+
+static int cli_dns_resolve(portal_core_t *core, int fd,
+                            const char *line, const char *args)
+{
+    (void)line;
+    if (!args || !*args) { cli_send(fd, "Usage: dns resolve <host>\n"); return -1; }
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (m && r) {
+        portal_msg_set_path(m, "/dns/functions/resolve");
+        portal_msg_set_method(m, PORTAL_METHOD_CALL);
+        portal_msg_add_header(m, "host", args);
+        core->send(core, m, r);
+        if (r->body) {
+            write(fd, r->body, r->body_len > 0 ? r->body_len : strlen(r->body));
+            write(fd, "\n", 1);
+        } else {
+            cli_send(fd, "(resolve failed)\n");
+        }
+        portal_msg_free(m); portal_resp_free(r);
+    }
+    return 0;
+}
+
+static int cli_dns_reverse(portal_core_t *core, int fd,
+                            const char *line, const char *args)
+{
+    (void)line;
+    if (!args || !*args) { cli_send(fd, "Usage: dns reverse <ip>\n"); return -1; }
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (m && r) {
+        portal_msg_set_path(m, "/dns/functions/reverse");
+        portal_msg_set_method(m, PORTAL_METHOD_CALL);
+        portal_msg_add_header(m, "ip", args);
+        core->send(core, m, r);
+        if (r->body) {
+            write(fd, r->body, r->body_len > 0 ? r->body_len : strlen(r->body));
+            write(fd, "\n", 1);
+        } else {
+            cli_send(fd, "(reverse lookup failed)\n");
+        }
+        portal_msg_free(m); portal_resp_free(r);
+    }
+    return 0;
+}
+
+static portal_cli_entry_t dns_cli_cmds[] = {
+    { .words = "dns resolve", .handler = cli_dns_resolve, .summary = "Resolve hostname to IP" },
+    { .words = "dns reverse", .handler = cli_dns_reverse, .summary = "Reverse DNS lookup" },
+    { .words = NULL }
+};
+
 int portal_module_load(portal_core_t *core)
 {
     g_core = core;
@@ -70,6 +130,10 @@ int portal_module_load(portal_core_t *core)
     core->path_register(core, "/dns/functions/lookup", "dns");
     core->path_set_access(core, "/dns/functions/lookup", PORTAL_ACCESS_RW);
 
+    /* Register CLI commands */
+    for (int i = 0; dns_cli_cmds[i].words; i++)
+        portal_cli_register(core, &dns_cli_cmds[i], "dns");
+
     core->log(core, PORTAL_LOG_INFO, "dns", "DNS resolver ready");
     return PORTAL_MODULE_OK;
 }
@@ -80,6 +144,7 @@ int portal_module_unload(portal_core_t *core)
     core->path_unregister(core, "/dns/functions/resolve");
     core->path_unregister(core, "/dns/functions/reverse");
     core->path_unregister(core, "/dns/functions/lookup");
+    portal_cli_unregister_module(core, "dns");
     core->log(core, PORTAL_LOG_INFO, "dns", "DNS resolver unloaded");
     g_core = NULL;
     return PORTAL_MODULE_OK;

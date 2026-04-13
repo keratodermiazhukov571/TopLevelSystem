@@ -489,6 +489,41 @@ static int exec_command(const char *cmd, char *out, size_t outlen, int *exit_cod
     return (int)total;
 }
 
+/* ── CLI command handlers (registered via portal_cli_register) ── */
+
+static void cli_send(int fd, const char *s)
+{
+    if (s) write(fd, s, strlen(s));
+}
+
+static int cli_process_exec(portal_core_t *core, int fd,
+                             const char *line, const char *args)
+{
+    (void)line;
+    if (!args || !*args) { cli_send(fd, "Usage: process exec <cmd>\n"); return -1; }
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (m && r) {
+        portal_msg_set_path(m, "/process/functions/exec");
+        portal_msg_set_method(m, PORTAL_METHOD_CALL);
+        portal_msg_add_header(m, "cmd", args);
+        core->send(core, m, r);
+        if (r->body) {
+            write(fd, r->body, r->body_len > 0 ? r->body_len : strlen(r->body));
+            write(fd, "\n", 1);
+        } else {
+            cli_send(fd, "(exec failed)\n");
+        }
+        portal_msg_free(m); portal_resp_free(r);
+    }
+    return 0;
+}
+
+static portal_cli_entry_t process_cli_cmds[] = {
+    { .words = "process exec", .handler = cli_process_exec, .summary = "Execute system command (sandboxed)" },
+    { .words = NULL }
+};
+
 int portal_module_load(portal_core_t *core)
 {
     g_core = core;
@@ -554,6 +589,10 @@ int portal_module_load(portal_core_t *core)
     g_prev_count = 0;
     g_prev_total_jiffies = 0;
 
+    /* Register CLI commands */
+    for (int i = 0; process_cli_cmds[i].words; i++)
+        portal_cli_register(core, &process_cli_cmds[i], "process");
+
     core->log(core, PORTAL_LOG_INFO, "process",
               "Process executor ready (%d allowed commands, timeout: %ds)",
               g_allowed_count, g_timeout);
@@ -570,6 +609,7 @@ int portal_module_unload(portal_core_t *core)
     core->path_unregister(core, "/process/resources/self");
     core->path_unregister(core, "/process/resources/portal_top");
     core->path_unregister(core, "/process/functions/exec");
+    portal_cli_unregister_module(core, "process");
     core->log(core, PORTAL_LOG_INFO, "process", "Process executor unloaded");
     g_core = NULL;
     return PORTAL_MODULE_OK;

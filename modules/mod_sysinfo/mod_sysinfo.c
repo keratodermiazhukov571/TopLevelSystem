@@ -55,6 +55,33 @@ static const char *get_hdr(const portal_msg_t *msg, const char *key)
     return NULL;
 }
 
+/* ── CLI command handlers (registered via portal_cli_register) ── */
+
+static void cli_get_path(int fd, const char *path)
+{
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (!m || !r) return;
+    portal_msg_set_path(m, path);
+    portal_msg_set_method(m, PORTAL_METHOD_GET);
+    g_core->send(g_core, m, r);
+    if (r->body) write(fd, r->body, r->body_len);
+    portal_msg_free(m); portal_resp_free(r);
+}
+
+static int cli_sysinfo(portal_core_t *core, int fd,
+                        const char *line, const char *args)
+{
+    (void)core; (void)line; (void)args;
+    cli_get_path(fd, "/sysinfo/resources/all");
+    return 0;
+}
+
+static portal_cli_entry_t sysinfo_cli_cmds[] = {
+    { .words = "sysinfo", .handler = cli_sysinfo, .summary = "System information overview" },
+    { .words = NULL }
+};
+
 int portal_module_load(portal_core_t *core)
 {
     g_core = core;
@@ -74,6 +101,10 @@ int portal_module_load(portal_core_t *core)
     core->path_register(core, "/sysinfo/resources/all", "sysinfo");
     core->path_set_access(core, "/sysinfo/resources/all", PORTAL_ACCESS_READ);
 
+    /* Register CLI commands */
+    for (int i = 0; sysinfo_cli_cmds[i].words; i++)
+        portal_cli_register(core, &sysinfo_cli_cmds[i], "sysinfo");
+
     core->log(core, PORTAL_LOG_INFO, "sysinfo", "System info module ready");
     return PORTAL_MODULE_OK;
 }
@@ -85,6 +116,7 @@ int portal_module_unload(portal_core_t *core)
     core->path_unregister(core, "/sysinfo/resources/network");
     core->path_unregister(core, "/sysinfo/resources/env");
     core->path_unregister(core, "/sysinfo/resources/all");
+    portal_cli_unregister_module(core, "sysinfo");
     core->log(core, PORTAL_LOG_INFO, "sysinfo", "System info unloaded");
     g_core = NULL;
     return PORTAL_MODULE_OK;

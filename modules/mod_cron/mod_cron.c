@@ -30,6 +30,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 #include "portal/portal.h"
 
 #define CRON_MAX_JOBS    100
@@ -95,6 +96,113 @@ static void cron_tick(void *userdata)
     }
 }
 
+/* ── CLI command handlers (registered via portal_cli_register) ── */
+
+static void cli_send(int fd, const char *s)
+{
+    if (s) write(fd, s, strlen(s));
+}
+
+static void cli_get_path(int fd, const char *path)
+{
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (!m || !r) return;
+    portal_msg_set_path(m, path);
+    portal_msg_set_method(m, PORTAL_METHOD_GET);
+    g_core->send(g_core, m, r);
+    if (r->body) write(fd, r->body, r->body_len);
+    portal_msg_free(m); portal_resp_free(r);
+}
+
+static int cli_cron_status(portal_core_t *core, int fd,
+                            const char *line, const char *args)
+{
+    (void)core; (void)line; (void)args;
+    cli_get_path(fd, "/cron/resources/status");
+    return 0;
+}
+
+static int cli_cron_jobs(portal_core_t *core, int fd,
+                          const char *line, const char *args)
+{
+    (void)core; (void)line; (void)args;
+    cli_get_path(fd, "/cron/resources/jobs");
+    return 0;
+}
+
+static int cli_cron_add(portal_core_t *core, int fd,
+                         const char *line, const char *args)
+{
+    (void)line;
+    char name[64] = {0}, path[PORTAL_MAX_PATH_LEN] = {0};
+    int interval = 0;
+    if (!args || sscanf(args, "%63s %d %1023s", name, &interval, path) != 3) {
+        cli_send(fd, "Usage: cron add <name> <interval_secs> <path>\n");
+        return -1;
+    }
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (m && r) {
+        portal_msg_set_path(m, "/cron/functions/add");
+        portal_msg_set_method(m, PORTAL_METHOD_CALL);
+        portal_msg_add_header(m, "name", name);
+        char is[16]; snprintf(is, sizeof(is), "%d", interval);
+        portal_msg_add_header(m, "interval", is);
+        portal_msg_add_header(m, "path", path);
+        core->send(core, m, r);
+        cli_send(fd, r->body ? r->body : "Error\n");
+        portal_msg_free(m); portal_resp_free(r);
+    }
+    return 0;
+}
+
+static int cli_cron_remove(portal_core_t *core, int fd,
+                            const char *line, const char *args)
+{
+    (void)line;
+    if (!args || !*args) { cli_send(fd, "Usage: cron remove <name>\n"); return -1; }
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (m && r) {
+        portal_msg_set_path(m, "/cron/functions/remove");
+        portal_msg_set_method(m, PORTAL_METHOD_CALL);
+        portal_msg_add_header(m, "name", args);
+        core->send(core, m, r);
+        cli_send(fd, r->body ? r->body : "Removed\n");
+        portal_msg_free(m); portal_resp_free(r);
+    }
+    return 0;
+}
+
+static int cli_cron_trigger(portal_core_t *core, int fd,
+                             const char *line, const char *args)
+{
+    (void)line;
+    if (!args || !*args) { cli_send(fd, "Usage: cron trigger <name>\n"); return -1; }
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (m && r) {
+        portal_msg_set_path(m, "/cron/functions/trigger");
+        portal_msg_set_method(m, PORTAL_METHOD_CALL);
+        portal_msg_add_header(m, "name", args);
+        core->send(core, m, r);
+        cli_send(fd, r->body ? r->body : "Triggered\n");
+        portal_msg_free(m); portal_resp_free(r);
+    }
+    return 0;
+}
+
+static portal_cli_entry_t cron_cli_cmds[] = {
+    { .words = "cron status",  .handler = cli_cron_status,  .summary = "Cron scheduler status" },
+    { .words = "cron jobs",    .handler = cli_cron_jobs,    .summary = "List scheduled cron jobs" },
+    { .words = "cron list",    .handler = cli_cron_jobs,    .summary = "List scheduled cron jobs" },
+    { .words = "cron add",     .handler = cli_cron_add,     .summary = "Add cron job: <name> <interval> <path>" },
+    { .words = "cron remove",  .handler = cli_cron_remove,  .summary = "Remove cron job by name" },
+    { .words = "cron trigger", .handler = cli_cron_trigger, .summary = "Force immediate cron job execution" },
+    { .words = NULL }
+};
+
 int portal_module_load(portal_core_t *core)
 {
     g_core = core;
@@ -140,6 +248,10 @@ int portal_module_load(portal_core_t *core)
      * on the common path. No new allocation, no blocking syscall. */
     core->timer_add(core, 1.0, cron_tick, NULL);
 
+    /* Register CLI commands */
+    for (int i = 0; cron_cli_cmds[i].words; i++)
+        portal_cli_register(core, &cron_cli_cmds[i], "cron");
+
     core->log(core, PORTAL_LOG_INFO, "cron",
               "Cron scheduler ready (max: %d jobs, autonomous 1 Hz tick)", g_max_jobs);
     return PORTAL_MODULE_OK;
@@ -152,6 +264,7 @@ int portal_module_unload(portal_core_t *core)
     core->path_unregister(core, "/cron/functions/add");
     core->path_unregister(core, "/cron/functions/remove");
     core->path_unregister(core, "/cron/functions/trigger");
+    portal_cli_unregister_module(core, "cron");
     core->log(core, PORTAL_LOG_INFO, "cron", "Cron unloaded");
     g_core = NULL;
     return PORTAL_MODULE_OK;

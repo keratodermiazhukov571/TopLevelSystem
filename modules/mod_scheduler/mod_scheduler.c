@@ -30,6 +30,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 #include "portal/portal.h"
 
 #define SCHED_MAX_TASKS  256
@@ -105,6 +106,65 @@ static void scheduler_tick(void)
     }
 }
 
+/* ── CLI command handlers (registered via portal_cli_register) ── */
+
+static void cli_send(int fd, const char *s)
+{
+    if (s) write(fd, s, strlen(s));
+}
+
+static void cli_get_path(int fd, const char *path)
+{
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (!m || !r) return;
+    portal_msg_set_path(m, path);
+    portal_msg_set_method(m, PORTAL_METHOD_GET);
+    g_core->send(g_core, m, r);
+    if (r->body) write(fd, r->body, r->body_len);
+    portal_msg_free(m); portal_resp_free(r);
+}
+
+static int cli_schedule_list(portal_core_t *core, int fd,
+                              const char *line, const char *args)
+{
+    (void)core; (void)line; (void)args;
+    cli_get_path(fd, "/scheduler/resources/tasks");
+    return 0;
+}
+
+static int cli_schedule_add(portal_core_t *core, int fd,
+                             const char *line, const char *args)
+{
+    (void)line;
+    char name[64] = {0}, path[PORTAL_MAX_PATH_LEN] = {0};
+    int delay = 0;
+    if (!args || sscanf(args, "%63s %d %1023s", name, &delay, path) != 3) {
+        cli_send(fd, "Usage: schedule <name> <delay_secs> <path>\n");
+        return -1;
+    }
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (m && r) {
+        portal_msg_set_path(m, "/scheduler/functions/schedule");
+        portal_msg_set_method(m, PORTAL_METHOD_CALL);
+        portal_msg_add_header(m, "name", name);
+        char ds[16]; snprintf(ds, sizeof(ds), "%d", delay);
+        portal_msg_add_header(m, "delay", ds);
+        portal_msg_add_header(m, "path", path);
+        core->send(core, m, r);
+        cli_send(fd, r->body ? r->body : "Scheduled\n");
+        portal_msg_free(m); portal_resp_free(r);
+    }
+    return 0;
+}
+
+static portal_cli_entry_t scheduler_cli_cmds[] = {
+    { .words = "schedule list", .handler = cli_schedule_list, .summary = "List scheduled one-shot tasks" },
+    { .words = "schedule",      .handler = cli_schedule_add,  .summary = "Schedule task: <name> <delay> <path>" },
+    { .words = NULL }
+};
+
 int portal_module_load(portal_core_t *core)
 {
     g_core = core;
@@ -131,6 +191,10 @@ int portal_module_load(portal_core_t *core)
     core->path_register(core, "/scheduler/functions/check", "scheduler");
     core->path_set_access(core, "/scheduler/functions/check", PORTAL_ACCESS_RW);
 
+    /* Register CLI commands */
+    for (int i = 0; scheduler_cli_cmds[i].words; i++)
+        portal_cli_register(core, &scheduler_cli_cmds[i], "scheduler");
+
     core->log(core, PORTAL_LOG_INFO, "scheduler",
               "One-shot scheduler ready (max: %d tasks)", g_max);
     return PORTAL_MODULE_OK;
@@ -143,6 +207,7 @@ int portal_module_unload(portal_core_t *core)
     core->path_unregister(core, "/scheduler/functions/schedule");
     core->path_unregister(core, "/scheduler/functions/cancel");
     core->path_unregister(core, "/scheduler/functions/check");
+    portal_cli_unregister_module(core, "scheduler");
     core->log(core, PORTAL_LOG_INFO, "scheduler", "Scheduler unloaded");
     g_core = NULL;
     return PORTAL_MODULE_OK;

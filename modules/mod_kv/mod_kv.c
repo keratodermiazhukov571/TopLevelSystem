@@ -79,6 +79,105 @@ static int kv_path(const char *key, char *out, size_t len)
     return 0;
 }
 
+/* ── CLI command handlers (registered via portal_cli_register) ── */
+
+static void cli_send(int fd, const char *s)
+{
+    if (s) write(fd, s, strlen(s));
+}
+
+static void cli_get_path(int fd, const char *path)
+{
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (!m || !r) return;
+    portal_msg_set_path(m, path);
+    portal_msg_set_method(m, PORTAL_METHOD_GET);
+    g_core->send(g_core, m, r);
+    if (r->body) write(fd, r->body, r->body_len);
+    portal_msg_free(m); portal_resp_free(r);
+}
+
+static int cli_kv_set(portal_core_t *core, int fd,
+                       const char *line, const char *args)
+{
+    (void)line;
+    char k[256] = {0}, v[4096] = {0};
+    if (!args || sscanf(args, "%255s %4095[^\n]", k, v) < 2) {
+        cli_send(fd, "Usage: kv set <key> <value>\n");
+        return -1;
+    }
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (m && r) {
+        portal_msg_set_path(m, "/kv/functions/set");
+        portal_msg_set_method(m, PORTAL_METHOD_CALL);
+        portal_msg_add_header(m, "key", k);
+        portal_msg_add_header(m, "value", v);
+        core->send(core, m, r);
+        cli_send(fd, r->body ? r->body : "Error\n");
+        portal_msg_free(m); portal_resp_free(r);
+    }
+    return 0;
+}
+
+static int cli_kv_get(portal_core_t *core, int fd,
+                       const char *line, const char *args)
+{
+    (void)line;
+    if (!args || !*args) { cli_send(fd, "Usage: kv get <key>\n"); return -1; }
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (m && r) {
+        portal_msg_set_path(m, "/kv/functions/get");
+        portal_msg_set_method(m, PORTAL_METHOD_CALL);
+        portal_msg_add_header(m, "key", args);
+        core->send(core, m, r);
+        if (r->status == PORTAL_OK && r->body) {
+            write(fd, r->body, r->body_len);
+            write(fd, "\n", 1);
+        } else {
+            cli_send(fd, "(not found)\n");
+        }
+        portal_msg_free(m); portal_resp_free(r);
+    }
+    return 0;
+}
+
+static int cli_kv_del(portal_core_t *core, int fd,
+                       const char *line, const char *args)
+{
+    (void)line;
+    if (!args || !*args) { cli_send(fd, "Usage: kv del <key>\n"); return -1; }
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (m && r) {
+        portal_msg_set_path(m, "/kv/functions/del");
+        portal_msg_set_method(m, PORTAL_METHOD_CALL);
+        portal_msg_add_header(m, "key", args);
+        core->send(core, m, r);
+        cli_send(fd, r->body ? r->body : "Deleted\n");
+        portal_msg_free(m); portal_resp_free(r);
+    }
+    return 0;
+}
+
+static int cli_kv_keys(portal_core_t *core, int fd,
+                        const char *line, const char *args)
+{
+    (void)core; (void)line; (void)args;
+    cli_get_path(fd, "/kv/resources/keys");
+    return 0;
+}
+
+static portal_cli_entry_t kv_cli_cmds[] = {
+    { .words = "kv set",   .handler = cli_kv_set,  .summary = "Set persistent key value" },
+    { .words = "kv get",   .handler = cli_kv_get,  .summary = "Get persistent key value" },
+    { .words = "kv del",   .handler = cli_kv_del,  .summary = "Delete persistent key" },
+    { .words = "kv keys",  .handler = cli_kv_keys, .summary = "List all persistent keys" },
+    { .words = NULL }
+};
+
 int portal_module_load(portal_core_t *core)
 {
     g_core = core;
@@ -110,6 +209,10 @@ int portal_module_load(portal_core_t *core)
     core->path_register(core, "/kv/functions/exists", "kv");
     core->path_set_access(core, "/kv/functions/exists", PORTAL_ACCESS_RW);
 
+    /* Register CLI commands */
+    for (int i = 0; kv_cli_cmds[i].words; i++)
+        portal_cli_register(core, &kv_cli_cmds[i], "kv");
+
     core->log(core, PORTAL_LOG_INFO, "kv",
               "KV store ready (dir: %s, max value: %zu bytes)", g_dir, g_max_value);
     return PORTAL_MODULE_OK;
@@ -123,6 +226,7 @@ int portal_module_unload(portal_core_t *core)
     core->path_unregister(core, "/kv/functions/set");
     core->path_unregister(core, "/kv/functions/del");
     core->path_unregister(core, "/kv/functions/exists");
+    portal_cli_unregister_module(core, "kv");
     core->log(core, PORTAL_LOG_INFO, "kv", "KV store unloaded");
     g_core = NULL;
     return PORTAL_MODULE_OK;

@@ -59,6 +59,56 @@ static const char *get_hdr(const portal_msg_t *msg, const char *key)
     return NULL;
 }
 
+/* ── CLI command handlers (registered via portal_cli_register) ── */
+
+static void cli_send(int fd, const char *s)
+{
+    if (s) write(fd, s, strlen(s));
+}
+
+static void cli_get_path(int fd, const char *path)
+{
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (!m || !r) return;
+    portal_msg_set_path(m, path);
+    portal_msg_set_method(m, PORTAL_METHOD_GET);
+    g_core->send(g_core, m, r);
+    if (r->body) write(fd, r->body, r->body_len);
+    portal_msg_free(m); portal_resp_free(r);
+}
+
+static int cli_backup_create(portal_core_t *core, int fd,
+                              const char *line, const char *args)
+{
+    (void)line;
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (m && r) {
+        portal_msg_set_path(m, "/backup/functions/create");
+        portal_msg_set_method(m, PORTAL_METHOD_CALL);
+        if (args && *args) portal_msg_add_header(m, "name", args);
+        core->send(core, m, r);
+        cli_send(fd, r->body ? r->body : "Created\n");
+        portal_msg_free(m); portal_resp_free(r);
+    }
+    return 0;
+}
+
+static int cli_backup_list(portal_core_t *core, int fd,
+                            const char *line, const char *args)
+{
+    (void)core; (void)line; (void)args;
+    cli_get_path(fd, "/backup/resources/list");
+    return 0;
+}
+
+static portal_cli_entry_t backup_cli_cmds[] = {
+    { .words = "backup create", .handler = cli_backup_create, .summary = "Create instance backup [name]" },
+    { .words = "backup list",   .handler = cli_backup_list,   .summary = "List available backups" },
+    { .words = NULL }
+};
+
 int portal_module_load(portal_core_t *core)
 {
     g_core = core;
@@ -91,6 +141,10 @@ int portal_module_load(portal_core_t *core)
     core->path_set_description(core, "/backup/functions/delete", "Delete a backup. Header: name");
     core->path_add_label(core, "/backup/functions/delete", "admin");
 
+    /* Register CLI commands */
+    for (int i = 0; backup_cli_cmds[i].words; i++)
+        portal_cli_register(core, &backup_cli_cmds[i], "backup");
+
     core->log(core, PORTAL_LOG_INFO, "backup",
               "Backup module ready (dir: %s, max: %d)", g_dir, g_max);
     return PORTAL_MODULE_OK;
@@ -103,6 +157,7 @@ int portal_module_unload(portal_core_t *core)
     core->path_unregister(core, "/backup/functions/create");
     core->path_unregister(core, "/backup/functions/restore");
     core->path_unregister(core, "/backup/functions/delete");
+    portal_cli_unregister_module(core, "backup");
     core->log(core, PORTAL_LOG_INFO, "backup", "Backup module unloaded");
     g_core = NULL;
     return PORTAL_MODULE_OK;

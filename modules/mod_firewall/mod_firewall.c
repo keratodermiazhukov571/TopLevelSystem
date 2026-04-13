@@ -34,6 +34,7 @@
 #include <string.h>
 #include <time.h>
 #include <pthread.h>
+#include <unistd.h>
 #include "portal/portal.h"
 
 #define FW_MAX_RULES     256
@@ -163,6 +164,100 @@ static int check_source(const char *source, char *reason, size_t rlen)
     return 0;
 }
 
+/* ── CLI command handlers (registered via portal_cli_register) ── */
+
+static void cli_send(int fd, const char *s)
+{
+    if (s) write(fd, s, strlen(s));
+}
+
+static void cli_get_path(int fd, const char *path)
+{
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (!m || !r) return;
+    portal_msg_set_path(m, path);
+    portal_msg_set_method(m, PORTAL_METHOD_GET);
+    g_core->send(g_core, m, r);
+    if (r->body) write(fd, r->body, r->body_len);
+    portal_msg_free(m); portal_resp_free(r);
+}
+
+static int cli_firewall_deny(portal_core_t *core, int fd,
+                              const char *line, const char *args)
+{
+    (void)line;
+    if (!args || !*args) { cli_send(fd, "Usage: firewall deny <source>\n"); return -1; }
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (m && r) {
+        portal_msg_set_path(m, "/firewall/functions/deny");
+        portal_msg_set_method(m, PORTAL_METHOD_CALL);
+        portal_msg_add_header(m, "source", args);
+        core->send(core, m, r);
+        cli_send(fd, r->body ? r->body : "Blocked\n");
+        portal_msg_free(m); portal_resp_free(r);
+    }
+    return 0;
+}
+
+static int cli_firewall_allow(portal_core_t *core, int fd,
+                               const char *line, const char *args)
+{
+    (void)line;
+    if (!args || !*args) { cli_send(fd, "Usage: firewall allow <source>\n"); return -1; }
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (m && r) {
+        portal_msg_set_path(m, "/firewall/functions/allow");
+        portal_msg_set_method(m, PORTAL_METHOD_CALL);
+        portal_msg_add_header(m, "source", args);
+        core->send(core, m, r);
+        cli_send(fd, r->body ? r->body : "Allowed\n");
+        portal_msg_free(m); portal_resp_free(r);
+    }
+    return 0;
+}
+
+static int cli_firewall_check(portal_core_t *core, int fd,
+                               const char *line, const char *args)
+{
+    (void)line;
+    if (!args || !*args) { cli_send(fd, "Usage: firewall check <source>\n"); return -1; }
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (m && r) {
+        portal_msg_set_path(m, "/firewall/functions/check");
+        portal_msg_set_method(m, PORTAL_METHOD_CALL);
+        portal_msg_add_header(m, "source", args);
+        core->send(core, m, r);
+        if (r->body) {
+            write(fd, r->body, r->body_len > 0 ? r->body_len : strlen(r->body));
+            write(fd, "\n", 1);
+        } else {
+            cli_send(fd, "(unknown)\n");
+        }
+        portal_msg_free(m); portal_resp_free(r);
+    }
+    return 0;
+}
+
+static int cli_firewall_rules(portal_core_t *core, int fd,
+                               const char *line, const char *args)
+{
+    (void)core; (void)line; (void)args;
+    cli_get_path(fd, "/firewall/resources/rules");
+    return 0;
+}
+
+static portal_cli_entry_t firewall_cli_cmds[] = {
+    { .words = "firewall deny",  .handler = cli_firewall_deny,  .summary = "Block a source IP/pattern" },
+    { .words = "firewall allow", .handler = cli_firewall_allow, .summary = "Allow a source IP/pattern" },
+    { .words = "firewall check", .handler = cli_firewall_check, .summary = "Check if source is blocked" },
+    { .words = "firewall rules", .handler = cli_firewall_rules, .summary = "List all firewall rules" },
+    { .words = NULL }
+};
+
 int portal_module_load(portal_core_t *core)
 {
     g_core = core;
@@ -202,6 +297,10 @@ int portal_module_load(portal_core_t *core)
     core->path_set_access(core, "/firewall/functions/clear", PORTAL_ACCESS_RW);
     core->path_add_label(core, "/firewall/functions/clear", "admin");
 
+    /* Register CLI commands */
+    for (int i = 0; firewall_cli_cmds[i].words; i++)
+        portal_cli_register(core, &firewall_cli_cmds[i], "firewall");
+
     core->log(core, PORTAL_LOG_INFO, "firewall",
               "Firewall ready (rate: %d/%ds)", g_rate_limit, g_rate_window);
     return PORTAL_MODULE_OK;
@@ -217,6 +316,7 @@ int portal_module_unload(portal_core_t *core)
     core->path_unregister(core, "/firewall/functions/remove");
     core->path_unregister(core, "/firewall/functions/check");
     core->path_unregister(core, "/firewall/functions/clear");
+    portal_cli_unregister_module(core, "firewall");
     core->log(core, PORTAL_LOG_INFO, "firewall", "Firewall unloaded");
     g_core = NULL;
     return PORTAL_MODULE_OK;

@@ -30,6 +30,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 #include "portal/portal.h"
 
 static portal_core_t *g_core = NULL;
@@ -94,6 +95,41 @@ static int json_wrap(const char *path, int status, const char *data,
         status, path, (long long)ts, escaped);
 }
 
+/* ── CLI command handlers (registered via portal_cli_register) ── */
+
+static void cli_send(int fd, const char *s)
+{
+    if (s) write(fd, s, strlen(s));
+}
+
+static int cli_json(portal_core_t *core, int fd,
+                     const char *line, const char *args)
+{
+    (void)line;
+    if (!args || !*args) { cli_send(fd, "Usage: json <path>\n"); return -1; }
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (m && r) {
+        portal_msg_set_path(m, "/json/functions/wrap");
+        portal_msg_set_method(m, PORTAL_METHOD_CALL);
+        portal_msg_add_header(m, "path", args);
+        core->send(core, m, r);
+        if (r->body) {
+            write(fd, r->body, r->body_len > 0 ? r->body_len : strlen(r->body));
+            write(fd, "\n", 1);
+        } else {
+            cli_send(fd, "(unavailable)\n");
+        }
+        portal_msg_free(m); portal_resp_free(r);
+    }
+    return 0;
+}
+
+static portal_cli_entry_t json_cli_cmds[] = {
+    { .words = "json", .handler = cli_json, .summary = "Query path and return as JSON" },
+    { .words = NULL }
+};
+
 /* --- Module lifecycle --- */
 
 int portal_module_load(portal_core_t *core)
@@ -112,6 +148,10 @@ int portal_module_load(portal_core_t *core)
     core->path_register(core, "/json/functions/wrap", "json");
     core->path_set_access(core, "/json/functions/wrap", PORTAL_ACCESS_RW);
 
+    /* Register CLI commands */
+    for (int i = 0; json_cli_cmds[i].words; i++)
+        portal_cli_register(core, &json_cli_cmds[i], "json");
+
     core->log(core, PORTAL_LOG_INFO, "json",
               "JSON formatter ready (pretty: %s)", g_pretty ? "on" : "off");
     return PORTAL_MODULE_OK;
@@ -122,6 +162,7 @@ int portal_module_unload(portal_core_t *core)
     core->path_unregister(core, "/json/resources/status");
     core->path_unregister(core, "/json/functions/format");
     core->path_unregister(core, "/json/functions/wrap");
+    portal_cli_unregister_module(core, "json");
     g_core = NULL;
     return PORTAL_MODULE_OK;
 }

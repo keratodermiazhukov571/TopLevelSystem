@@ -30,6 +30,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <lzma.h>
 #include "portal/portal.h"
 
@@ -98,6 +99,41 @@ static int xz_decompress(const void *in, size_t inlen,
     return 0;
 }
 
+/* ── CLI command handlers (registered via portal_cli_register) ── */
+
+static void cli_send(int fd, const char *s)
+{
+    if (s) write(fd, s, strlen(s));
+}
+
+static int cli_compress_xz(portal_core_t *core, int fd,
+                            const char *line, const char *args)
+{
+    (void)line;
+    if (!args || !*args) { cli_send(fd, "Usage: compress xz <data>\n"); return -1; }
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (m && r) {
+        portal_msg_set_path(m, "/xz/functions/compress");
+        portal_msg_set_method(m, PORTAL_METHOD_CALL);
+        portal_msg_add_header(m, "data", args);
+        core->send(core, m, r);
+        if (r->body) {
+            write(fd, r->body, r->body_len > 0 ? r->body_len : strlen(r->body));
+            write(fd, "\n", 1);
+        } else {
+            cli_send(fd, "(compress failed)\n");
+        }
+        portal_msg_free(m); portal_resp_free(r);
+    }
+    return 0;
+}
+
+static portal_cli_entry_t xz_cli_cmds[] = {
+    { .words = "compress xz", .handler = cli_compress_xz, .summary = "XZ compress data" },
+    { .words = NULL }
+};
+
 int portal_module_load(portal_core_t *core)
 {
     g_core = core;
@@ -122,6 +158,10 @@ int portal_module_load(portal_core_t *core)
     core->path_set_access(core, "/xz/functions/decompress", PORTAL_ACCESS_RW);
     core->path_set_description(core, "/xz/functions/decompress", "XZ decompress. Body: compressed data");
 
+    /* Register CLI commands */
+    for (int i = 0; xz_cli_cmds[i].words; i++)
+        portal_cli_register(core, &xz_cli_cmds[i], "xz");
+
     core->log(core, PORTAL_LOG_INFO, "xz",
               "XZ compression ready (level: %d, max: %zu bytes)",
               g_level, g_max_size);
@@ -133,6 +173,7 @@ int portal_module_unload(portal_core_t *core)
     core->path_unregister(core, "/xz/resources/status");
     core->path_unregister(core, "/xz/functions/compress");
     core->path_unregister(core, "/xz/functions/decompress");
+    portal_cli_unregister_module(core, "xz");
     core->log(core, PORTAL_LOG_INFO, "xz", "XZ compression unloaded");
     g_core = NULL;
     return PORTAL_MODULE_OK;

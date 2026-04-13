@@ -2924,6 +2924,238 @@ static void hs_sweep_timer_cb(void *userdata)
 }
 
 /* ================================================================
+ * CLI command handlers (registered via portal_cli_register)
+ * ================================================================ */
+
+static void cli_send(int fd, const char *s)
+{
+    if (s) write(fd, s, strlen(s));
+}
+
+static void cli_get_path(int fd, const char *path)
+{
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (!m || !r) return;
+    portal_msg_set_path(m, path);
+    portal_msg_set_method(m, PORTAL_METHOD_GET);
+    g_core->send(g_core, m, r);
+    if (r->body) write(fd, r->body, r->body_len);
+    portal_msg_free(m); portal_resp_free(r);
+}
+
+static int cli_ping(portal_core_t *core, int fd,
+                     const char *line, const char *args)
+{
+    (void)line;
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (m && r) {
+        portal_msg_set_path(m, "/node/functions/ping");
+        portal_msg_set_method(m, PORTAL_METHOD_CALL);
+        portal_msg_add_header(m, "name", (args && *args) ? args : "all");
+        core->send(core, m, r);
+        if (r->body)
+            write(fd, r->body, r->body_len > 0 ? r->body_len : strlen(r->body));
+        else
+            cli_send(fd, (args && *args) ? "(ping failed)\n" : "(no peers)\n");
+        portal_msg_free(m); portal_resp_free(r);
+    }
+    return 0;
+}
+
+static int cli_tracert(portal_core_t *core, int fd,
+                        const char *line, const char *args)
+{
+    (void)line;
+    if (!args || !*args) { cli_send(fd, "Usage: tracert <path>\n"); return -1; }
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (m && r) {
+        portal_msg_set_path(m, "/node/functions/trace");
+        portal_msg_set_method(m, PORTAL_METHOD_CALL);
+        portal_msg_add_header(m, "path", args);
+        core->send(core, m, r);
+        if (r->body)
+            write(fd, r->body, r->body_len > 0 ? r->body_len : strlen(r->body));
+        else
+            cli_send(fd, "(trace failed)\n");
+        portal_msg_free(m); portal_resp_free(r);
+    }
+    return 0;
+}
+
+static int cli_node_status(portal_core_t *core, int fd,
+                            const char *line, const char *args)
+{
+    (void)line;
+    if (args && *args) {
+        /* node status <peer> — show local peer info + remote location */
+        portal_msg_t *m = portal_msg_alloc();
+        portal_resp_t *r = portal_resp_alloc();
+        if (m && r) {
+            char path[PORTAL_MAX_PATH_LEN];
+            snprintf(path, sizeof(path), "/node/resources/peer/%s", args);
+            portal_msg_set_path(m, path);
+            portal_msg_set_method(m, PORTAL_METHOD_GET);
+            core->send(core, m, r);
+            if (r->body)
+                write(fd, r->body, r->body_len > 0 ? r->body_len : strlen(r->body));
+            else
+                cli_send(fd, "(peer not found)\n");
+            portal_msg_free(m); portal_resp_free(r);
+        }
+        /* Also query remote node status for location/GPS */
+        m = portal_msg_alloc();
+        r = portal_resp_alloc();
+        if (m && r) {
+            char path[PORTAL_MAX_PATH_LEN];
+            snprintf(path, sizeof(path), "/%s/node/resources/status", args);
+            portal_msg_set_path(m, path);
+            portal_msg_set_method(m, PORTAL_METHOD_GET);
+            core->send(core, m, r);
+            if (r->body && r->body_len > 0) {
+                const char *body = r->body;
+                const char *loc = strstr(body, "Location:");
+                const char *gps = strstr(body, "GPS:");
+                if (loc) {
+                    const char *end = strchr(loc, '\n');
+                    if (end) write(fd, loc, (size_t)(end - loc + 1));
+                }
+                if (gps) {
+                    const char *end = strchr(gps, '\n');
+                    if (end) write(fd, gps, (size_t)(end - gps + 1));
+                }
+            }
+            portal_msg_free(m); portal_resp_free(r);
+        }
+    } else {
+        cli_get_path(fd, "/node/resources/status");
+    }
+    return 0;
+}
+
+static int cli_node_peers(portal_core_t *core, int fd,
+                           const char *line, const char *args)
+{
+    (void)core; (void)line; (void)args;
+    cli_get_path(fd, "/node/resources/peers");
+    return 0;
+}
+
+static int cli_node_ping(portal_core_t *core, int fd,
+                          const char *line, const char *args)
+{
+    (void)line;
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (m && r) {
+        portal_msg_set_path(m, "/node/functions/ping");
+        portal_msg_set_method(m, PORTAL_METHOD_CALL);
+        portal_msg_add_header(m, "name", (args && *args) ? args : "all");
+        core->send(core, m, r);
+        if (r->body)
+            write(fd, r->body, r->body_len > 0 ? r->body_len : strlen(r->body));
+        else
+            cli_send(fd, (args && *args) ? "(ping failed)\n" : "(no peers)\n");
+        portal_msg_free(m); portal_resp_free(r);
+    }
+    return 0;
+}
+
+static int cli_node_trace(portal_core_t *core, int fd,
+                           const char *line, const char *args)
+{
+    (void)line;
+    if (!args || !*args) { cli_send(fd, "Usage: node trace <path>\n"); return -1; }
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (m && r) {
+        portal_msg_set_path(m, "/node/functions/trace");
+        portal_msg_set_method(m, PORTAL_METHOD_CALL);
+        portal_msg_add_header(m, "path", args);
+        core->send(core, m, r);
+        if (r->body)
+            write(fd, r->body, r->body_len > 0 ? r->body_len : strlen(r->body));
+        else
+            cli_send(fd, "(trace failed)\n");
+        portal_msg_free(m); portal_resp_free(r);
+    }
+    return 0;
+}
+
+static int cli_node_location(portal_core_t *core, int fd,
+                              const char *line, const char *args)
+{
+    (void)line;
+    if (!args || !*args) { cli_send(fd, "Usage: node location <name>\n"); return -1; }
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (m && r) {
+        portal_msg_set_path(m, "/node/functions/location");
+        portal_msg_set_method(m, PORTAL_METHOD_CALL);
+        portal_msg_add_header(m, "name", args);
+        core->send(core, m, r);
+        if (r->body)
+            write(fd, r->body, r->body_len > 0 ? r->body_len : strlen(r->body));
+        portal_msg_free(m); portal_resp_free(r);
+    }
+    return 0;
+}
+
+static int cli_node_gps(portal_core_t *core, int fd,
+                         const char *line, const char *args)
+{
+    (void)line;
+    if (!args || !*args) { cli_send(fd, "Usage: node gps <coords>\n"); return -1; }
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (m && r) {
+        portal_msg_set_path(m, "/node/functions/location");
+        portal_msg_set_method(m, PORTAL_METHOD_CALL);
+        portal_msg_add_header(m, "gps", args);
+        core->send(core, m, r);
+        if (r->body)
+            write(fd, r->body, r->body_len > 0 ? r->body_len : strlen(r->body));
+        portal_msg_free(m); portal_resp_free(r);
+    }
+    return 0;
+}
+
+static int cli_node_geolocate(portal_core_t *core, int fd,
+                               const char *line, const char *args)
+{
+    (void)line; (void)args;
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (m && r) {
+        portal_msg_set_path(m, "/node/functions/geolocate");
+        portal_msg_set_method(m, PORTAL_METHOD_CALL);
+        core->send(core, m, r);
+        if (r->body)
+            write(fd, r->body, r->body_len > 0 ? r->body_len : strlen(r->body));
+        else
+            cli_send(fd, "(geolocation failed)\n");
+        portal_msg_free(m); portal_resp_free(r);
+    }
+    return 0;
+}
+
+static portal_cli_entry_t node_cli_cmds[] = {
+    { .words = "ping",             .handler = cli_ping,            .summary = "Ping federation peer(s)" },
+    { .words = "tracert",          .handler = cli_tracert,         .summary = "Trace route through federation" },
+    { .words = "node status",      .handler = cli_node_status,     .summary = "Node status [peer]" },
+    { .words = "node peers",       .handler = cli_node_peers,      .summary = "List federation peers" },
+    { .words = "node ping",        .handler = cli_node_ping,       .summary = "Ping federation peer(s)" },
+    { .words = "node trace",       .handler = cli_node_trace,      .summary = "Trace route through federation" },
+    { .words = "node location",    .handler = cli_node_location,   .summary = "Set node location name" },
+    { .words = "node gps",         .handler = cli_node_gps,        .summary = "Set node GPS coordinates" },
+    { .words = "node geolocate",   .handler = cli_node_geolocate,  .summary = "Auto-detect node location from IP" },
+    { .words = "node",             .handler = cli_node_status,     .summary = "Node federation status" },
+    { .words = NULL }
+};
+
+/* ================================================================
  * Module lifecycle
  * ================================================================ */
 
@@ -3113,6 +3345,10 @@ int portal_module_load(portal_core_t *core)
     core->path_set_access(core, "/node/functions/renew_tls", PORTAL_ACCESS_RW);
 #endif
 
+    /* Register CLI commands */
+    for (int i = 0; node_cli_cmds[i].words; i++)
+        portal_cli_register(core, &node_cli_cmds[i], "node");
+
     /* Connect to configured peers */
     for (int i = 0; i < NODE_MAX_PEERS; i++) {
         char key[32];
@@ -3212,6 +3448,7 @@ int portal_module_unload(portal_core_t *core)
     free_tls_contexts();
 #endif
 
+    portal_cli_unregister_module(core, "node");
     core->log(core, PORTAL_LOG_INFO, "node", "Node module unloaded");
     g_core = NULL;
     return PORTAL_MODULE_OK;

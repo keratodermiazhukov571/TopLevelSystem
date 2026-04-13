@@ -1172,43 +1172,7 @@ static void handle_command(int fd, char *line)
         cmd_core_get(fd, "/core/storage");
     } else if (strcmp(line, "events") == 0) {
         cmd_core_get(fd, "/events");
-    } else if (strncmp(line, "node location ", 14) == 0) {
-        portal_msg_t *m = portal_msg_alloc();
-        portal_resp_t *r = portal_resp_alloc();
-        if (m && r) {
-            portal_msg_set_path(m, "/node/functions/location");
-            portal_msg_set_method(m, PORTAL_METHOD_CALL);
-            portal_msg_add_header(m, "name", line + 14);
-            g_core->send(g_core, m, r);
-            if (r->body)
-                write(fd, r->body, r->body_len > 0 ? r->body_len : strlen(r->body));
-            portal_msg_free(m); portal_resp_free(r);
-        }
-    } else if (strncmp(line, "node gps ", 9) == 0) {
-        portal_msg_t *m = portal_msg_alloc();
-        portal_resp_t *r = portal_resp_alloc();
-        if (m && r) {
-            portal_msg_set_path(m, "/node/functions/location");
-            portal_msg_set_method(m, PORTAL_METHOD_CALL);
-            portal_msg_add_header(m, "gps", line + 9);
-            g_core->send(g_core, m, r);
-            if (r->body)
-                write(fd, r->body, r->body_len > 0 ? r->body_len : strlen(r->body));
-            portal_msg_free(m); portal_resp_free(r);
-        }
-    } else if (strcmp(line, "node geolocate") == 0) {
-        portal_msg_t *m = portal_msg_alloc();
-        portal_resp_t *r = portal_resp_alloc();
-        if (m && r) {
-            portal_msg_set_path(m, "/node/functions/geolocate");
-            portal_msg_set_method(m, PORTAL_METHOD_CALL);
-            g_core->send(g_core, m, r);
-            if (r->body)
-                write(fd, r->body, r->body_len > 0 ? r->body_len : strlen(r->body));
-            else
-                send_str(fd, "(geolocation failed)\n");
-            portal_msg_free(m); portal_resp_free(r);
-        }
+    /* node location/gps/geolocate commands: now registered by mod_node via portal_cli_register */
     } else if (strcmp(line, "locks") == 0) {
         cmd_core_get(fd, "/core/locks");
     } else if (strncmp(line, "locks ", 6) == 0) {
@@ -1471,639 +1435,23 @@ static void handle_command(int fd, char *line)
     /* --- Cache commands --- */
     /* cache commands: now registered by mod_cache via portal_cli_register.
      * Dispatched via the registered-command fallback at the end of this chain. */
-    /* --- Cron commands --- */
-    } else if (strcmp(line, "cron status") == 0) {
-        cmd_core_get(fd, "/cron/resources/status");
-    } else if (strcmp(line, "cron jobs") == 0 || strcmp(line, "cron list") == 0) {
-        cmd_core_get(fd, "/cron/resources/jobs");
-    } else if (strncmp(line, "cron add ", 9) == 0) {
-        /* cron add <name> <interval> <path> */
-        char name[64] = {0}, path[PORTAL_MAX_PATH_LEN] = {0};
-        int interval = 0;
-        if (sscanf(line + 9, "%63s %d %1023s", name, &interval, path) == 3) {
-            portal_msg_t *m = portal_msg_alloc();
-            portal_resp_t *r = portal_resp_alloc();
-            if (m && r) {
-                portal_msg_set_path(m, "/cron/functions/add");
-                portal_msg_set_method(m, PORTAL_METHOD_CALL);
-                portal_msg_add_header(m, "name", name);
-                char is[16]; snprintf(is, sizeof(is), "%d", interval);
-                portal_msg_add_header(m, "interval", is);
-                portal_msg_add_header(m, "path", path);
-                g_core->send(g_core, m, r);
-                send_str(fd, r->body ? r->body : "Error\n");
-                portal_msg_free(m); portal_resp_free(r);
-            }
-        } else {
-            send_str(fd, "Usage: cron add <name> <interval_secs> <path>\n");
-        }
-    } else if (strncmp(line, "cron remove ", 12) == 0) {
-        portal_msg_t *m = portal_msg_alloc();
-        portal_resp_t *r = portal_resp_alloc();
-        if (m && r) {
-            portal_msg_set_path(m, "/cron/functions/remove");
-            portal_msg_set_method(m, PORTAL_METHOD_CALL);
-            portal_msg_add_header(m, "name", line + 12);
-            g_core->send(g_core, m, r);
-            send_str(fd, r->body ? r->body : "Removed\n");
-            portal_msg_free(m); portal_resp_free(r);
-        }
-    } else if (strncmp(line, "cron trigger ", 13) == 0) {
-        portal_msg_t *m = portal_msg_alloc();
-        portal_resp_t *r = portal_resp_alloc();
-        if (m && r) {
-            portal_msg_set_path(m, "/cron/functions/trigger");
-            portal_msg_set_method(m, PORTAL_METHOD_CALL);
-            portal_msg_add_header(m, "name", line + 13);
-            g_core->send(g_core, m, r);
-            send_str(fd, r->body ? r->body : "Triggered\n");
-            portal_msg_free(m); portal_resp_free(r);
-        }
-    /* --- Health commands --- */
-    } else if (strcmp(line, "health") == 0 || strcmp(line, "health status") == 0) {
-        cmd_core_get(fd, "/health/resources/status");
-    } else if (strcmp(line, "health live") == 0) {
-        cmd_core_get(fd, "/health/resources/live");
-    } else if (strcmp(line, "health ready") == 0) {
-        cmd_core_get(fd, "/health/resources/ready");
-    } else if (strcmp(line, "uptime") == 0) {
-        cmd_core_get(fd, "/health/resources/uptime");
-    /* --- JSON commands --- */
-    } else if (strncmp(line, "json ", 5) == 0) {
-        /* json <path> → query path and return as JSON */
-        portal_msg_t *m = portal_msg_alloc();
-        portal_resp_t *r = portal_resp_alloc();
-        if (m && r) {
-            portal_msg_set_path(m, "/json/functions/wrap");
-            portal_msg_set_method(m, PORTAL_METHOD_CALL);
-            portal_msg_add_header(m, "path", line + 5);
-            g_core->send(g_core, m, r);
-            if (r->body) {
-                write(fd, r->body, r->body_len > 0 ? r->body_len : strlen(r->body));
-                write(fd, "\n", 1);
-            } else {
-                send_str(fd, "(unavailable)\n");
-            }
-            portal_msg_free(m); portal_resp_free(r);
-        }
-    /* --- HTTP client commands --- */
-    } else if (strncmp(line, "curl ", 5) == 0) {
-        /* curl <url> → HTTP GET via mod_http_client */
-        portal_msg_t *m = portal_msg_alloc();
-        portal_resp_t *r = portal_resp_alloc();
-        if (m && r) {
-            portal_msg_set_path(m, "/httpc/functions/get");
-            portal_msg_set_method(m, PORTAL_METHOD_CALL);
-            portal_msg_add_header(m, "url", line + 5);
-            g_core->send(g_core, m, r);
-            if (r->body) {
-                write(fd, r->body, r->body_len > 0 ? r->body_len : strlen(r->body));
-                write(fd, "\n", 1);
-            } else {
-                send_str(fd, "(request failed)\n");
-            }
-            portal_msg_free(m); portal_resp_free(r);
-        }
-    /* --- KV commands --- */
-    } else if (strncmp(line, "kv set ", 7) == 0) {
-        char k[256] = {0}, v[4096] = {0};
-        if (sscanf(line + 7, "%255s %4095[^\n]", k, v) >= 2) {
-            portal_msg_t *m = portal_msg_alloc();
-            portal_resp_t *r = portal_resp_alloc();
-            if (m && r) {
-                portal_msg_set_path(m, "/kv/functions/set");
-                portal_msg_set_method(m, PORTAL_METHOD_CALL);
-                portal_msg_add_header(m, "key", k);
-                portal_msg_add_header(m, "value", v);
-                g_core->send(g_core, m, r);
-                send_str(fd, r->body ? r->body : "Error\n");
-                portal_msg_free(m); portal_resp_free(r);
-            }
-        } else {
-            send_str(fd, "Usage: kv set <key> <value>\n");
-        }
-    } else if (strncmp(line, "kv get ", 7) == 0) {
-        portal_msg_t *m = portal_msg_alloc();
-        portal_resp_t *r = portal_resp_alloc();
-        if (m && r) {
-            portal_msg_set_path(m, "/kv/functions/get");
-            portal_msg_set_method(m, PORTAL_METHOD_CALL);
-            portal_msg_add_header(m, "key", line + 7);
-            g_core->send(g_core, m, r);
-            if (r->status == PORTAL_OK && r->body) {
-                write(fd, r->body, r->body_len);
-                write(fd, "\n", 1);
-            } else {
-                send_str(fd, "(not found)\n");
-            }
-            portal_msg_free(m); portal_resp_free(r);
-        }
-    } else if (strncmp(line, "kv del ", 7) == 0) {
-        portal_msg_t *m = portal_msg_alloc();
-        portal_resp_t *r = portal_resp_alloc();
-        if (m && r) {
-            portal_msg_set_path(m, "/kv/functions/del");
-            portal_msg_set_method(m, PORTAL_METHOD_CALL);
-            portal_msg_add_header(m, "key", line + 7);
-            g_core->send(g_core, m, r);
-            send_str(fd, r->body ? r->body : "Deleted\n");
-            portal_msg_free(m); portal_resp_free(r);
-        }
-    } else if (strcmp(line, "kv keys") == 0) {
-        cmd_core_get(fd, "/kv/resources/keys");
-    /* --- Firewall commands --- */
-    } else if (strncmp(line, "firewall deny ", 14) == 0) {
-        portal_msg_t *m = portal_msg_alloc();
-        portal_resp_t *r = portal_resp_alloc();
-        if (m && r) {
-            portal_msg_set_path(m, "/firewall/functions/deny");
-            portal_msg_set_method(m, PORTAL_METHOD_CALL);
-            portal_msg_add_header(m, "source", line + 14);
-            g_core->send(g_core, m, r);
-            send_str(fd, r->body ? r->body : "Blocked\n");
-            portal_msg_free(m); portal_resp_free(r);
-        }
-    } else if (strncmp(line, "firewall allow ", 15) == 0) {
-        portal_msg_t *m = portal_msg_alloc();
-        portal_resp_t *r = portal_resp_alloc();
-        if (m && r) {
-            portal_msg_set_path(m, "/firewall/functions/allow");
-            portal_msg_set_method(m, PORTAL_METHOD_CALL);
-            portal_msg_add_header(m, "source", line + 15);
-            g_core->send(g_core, m, r);
-            send_str(fd, r->body ? r->body : "Allowed\n");
-            portal_msg_free(m); portal_resp_free(r);
-        }
-    } else if (strncmp(line, "firewall check ", 15) == 0) {
-        portal_msg_t *m = portal_msg_alloc();
-        portal_resp_t *r = portal_resp_alloc();
-        if (m && r) {
-            portal_msg_set_path(m, "/firewall/functions/check");
-            portal_msg_set_method(m, PORTAL_METHOD_CALL);
-            portal_msg_add_header(m, "source", line + 15);
-            g_core->send(g_core, m, r);
-            if (r->body) {
-                write(fd, r->body, r->body_len > 0 ? r->body_len : strlen(r->body));
-                write(fd, "\n", 1);
-            } else {
-                send_str(fd, "(unknown)\n");
-            }
-            portal_msg_free(m); portal_resp_free(r);
-        }
-    } else if (strcmp(line, "firewall rules") == 0) {
-        cmd_core_get(fd, "/firewall/resources/rules");
-    /* --- Backup commands --- */
-    } else if (strncmp(line, "backup create", 13) == 0) {
-        portal_msg_t *m = portal_msg_alloc();
-        portal_resp_t *r = portal_resp_alloc();
-        if (m && r) {
-            portal_msg_set_path(m, "/backup/functions/create");
-            portal_msg_set_method(m, PORTAL_METHOD_CALL);
-            const char *name = line + 13;
-            while (*name == ' ') name++;
-            if (*name) portal_msg_add_header(m, "name", name);
-            g_core->send(g_core, m, r);
-            send_str(fd, r->body ? r->body : "Created\n");
-            portal_msg_free(m); portal_resp_free(r);
-        }
-    } else if (strcmp(line, "backup list") == 0) {
-        cmd_core_get(fd, "/backup/resources/list");
-    /* --- DNS commands --- */
-    } else if (strncmp(line, "dns resolve ", 12) == 0) {
-        portal_msg_t *m = portal_msg_alloc();
-        portal_resp_t *r = portal_resp_alloc();
-        if (m && r) {
-            portal_msg_set_path(m, "/dns/functions/resolve");
-            portal_msg_set_method(m, PORTAL_METHOD_CALL);
-            portal_msg_add_header(m, "host", line + 12);
-            g_core->send(g_core, m, r);
-            if (r->body) {
-                write(fd, r->body, r->body_len > 0 ? r->body_len : strlen(r->body));
-                write(fd, "\n", 1);
-            } else {
-                send_str(fd, "(resolve failed)\n");
-            }
-            portal_msg_free(m); portal_resp_free(r);
-        }
-    } else if (strncmp(line, "dns reverse ", 12) == 0) {
-        portal_msg_t *m = portal_msg_alloc();
-        portal_resp_t *r = portal_resp_alloc();
-        if (m && r) {
-            portal_msg_set_path(m, "/dns/functions/reverse");
-            portal_msg_set_method(m, PORTAL_METHOD_CALL);
-            portal_msg_add_header(m, "ip", line + 12);
-            g_core->send(g_core, m, r);
-            if (r->body) {
-                write(fd, r->body, r->body_len > 0 ? r->body_len : strlen(r->body));
-                write(fd, "\n", 1);
-            } else {
-                send_str(fd, "(reverse lookup failed)\n");
-            }
-            portal_msg_free(m); portal_resp_free(r);
-        }
-    /* --- Node commands (with shortcuts: ping, tracert) --- */
-    } else if (strncmp(line, "ping ", 5) == 0) {
-        portal_msg_t *m = portal_msg_alloc();
-        portal_resp_t *r = portal_resp_alloc();
-        if (m && r) {
-            portal_msg_set_path(m, "/node/functions/ping");
-            portal_msg_set_method(m, PORTAL_METHOD_CALL);
-            portal_msg_add_header(m, "name", line + 5);
-            g_core->send(g_core, m, r);
-            if (r->body)
-                write(fd, r->body, r->body_len > 0 ? r->body_len : strlen(r->body));
-            else
-                send_str(fd, "(ping failed)\n");
-            portal_msg_free(m); portal_resp_free(r);
-        }
-    } else if (strcmp(line, "ping") == 0) {
-        portal_msg_t *m = portal_msg_alloc();
-        portal_resp_t *r = portal_resp_alloc();
-        if (m && r) {
-            portal_msg_set_path(m, "/node/functions/ping");
-            portal_msg_set_method(m, PORTAL_METHOD_CALL);
-            portal_msg_add_header(m, "name", "all");
-            g_core->send(g_core, m, r);
-            if (r->body)
-                write(fd, r->body, r->body_len > 0 ? r->body_len : strlen(r->body));
-            else
-                send_str(fd, "(no peers)\n");
-            portal_msg_free(m); portal_resp_free(r);
-        }
-    } else if (strncmp(line, "tracert ", 8) == 0) {
-        portal_msg_t *m = portal_msg_alloc();
-        portal_resp_t *r = portal_resp_alloc();
-        if (m && r) {
-            portal_msg_set_path(m, "/node/functions/trace");
-            portal_msg_set_method(m, PORTAL_METHOD_CALL);
-            portal_msg_add_header(m, "path", line + 8);
-            g_core->send(g_core, m, r);
-            if (r->body)
-                write(fd, r->body, r->body_len > 0 ? r->body_len : strlen(r->body));
-            else
-                send_str(fd, "(trace failed)\n");
-            portal_msg_free(m); portal_resp_free(r);
-        }
-    } else if (strcmp(line, "node") == 0 || strcmp(line, "node status") == 0) {
-        cmd_core_get(fd, "/node/resources/status");
-    } else if (strcmp(line, "node peers") == 0) {
-        cmd_core_get(fd, "/node/resources/peers");
-    } else if (strncmp(line, "node status ", 12) == 0) {
-        const char *peer = line + 12;
-        /* Show local peer info */
-        portal_msg_t *m = portal_msg_alloc();
-        portal_resp_t *r = portal_resp_alloc();
-        if (m && r) {
-            char path[PORTAL_MAX_PATH_LEN];
-            snprintf(path, sizeof(path), "/node/resources/peer/%s", peer);
-            portal_msg_set_path(m, path);
-            portal_msg_set_method(m, PORTAL_METHOD_GET);
-            g_core->send(g_core, m, r);
-            if (r->body)
-                write(fd, r->body, r->body_len > 0 ? r->body_len : strlen(r->body));
-            else
-                send_str(fd, "(peer not found)\n");
-            portal_msg_free(m); portal_resp_free(r);
-        }
-        /* Also query remote node status for location/GPS */
-        m = portal_msg_alloc();
-        r = portal_resp_alloc();
-        if (m && r) {
-            char path[PORTAL_MAX_PATH_LEN];
-            snprintf(path, sizeof(path), "/%s/node/resources/status", peer);
-            portal_msg_set_path(m, path);
-            portal_msg_set_method(m, PORTAL_METHOD_GET);
-            g_core->send(g_core, m, r);
-            if (r->body && r->body_len > 0) {
-                /* Extract Location and GPS lines */
-                const char *body = r->body;
-                const char *loc = strstr(body, "Location:");
-                const char *gps = strstr(body, "GPS:");
-                if (loc) {
-                    const char *end = strchr(loc, '\n');
-                    if (end) write(fd, loc, (size_t)(end - loc + 1));
-                }
-                if (gps) {
-                    const char *end = strchr(gps, '\n');
-                    if (end) write(fd, gps, (size_t)(end - gps + 1));
-                }
-            }
-            portal_msg_free(m); portal_resp_free(r);
-        }
-    } else if (strncmp(line, "node ping ", 10) == 0) {
-        portal_msg_t *m = portal_msg_alloc();
-        portal_resp_t *r = portal_resp_alloc();
-        if (m && r) {
-            portal_msg_set_path(m, "/node/functions/ping");
-            portal_msg_set_method(m, PORTAL_METHOD_CALL);
-            portal_msg_add_header(m, "name", line + 10);
-            g_core->send(g_core, m, r);
-            if (r->body)
-                write(fd, r->body, r->body_len > 0 ? r->body_len : strlen(r->body));
-            else
-                send_str(fd, "(ping failed)\n");
-            portal_msg_free(m); portal_resp_free(r);
-        }
-    } else if (strcmp(line, "node ping") == 0) {
-        portal_msg_t *m = portal_msg_alloc();
-        portal_resp_t *r = portal_resp_alloc();
-        if (m && r) {
-            portal_msg_set_path(m, "/node/functions/ping");
-            portal_msg_set_method(m, PORTAL_METHOD_CALL);
-            portal_msg_add_header(m, "name", "all");
-            g_core->send(g_core, m, r);
-            if (r->body)
-                write(fd, r->body, r->body_len > 0 ? r->body_len : strlen(r->body));
-            else
-                send_str(fd, "(no peers)\n");
-            portal_msg_free(m); portal_resp_free(r);
-        }
-    } else if (strncmp(line, "node trace ", 11) == 0) {
-        portal_msg_t *m = portal_msg_alloc();
-        portal_resp_t *r = portal_resp_alloc();
-        if (m && r) {
-            portal_msg_set_path(m, "/node/functions/trace");
-            portal_msg_set_method(m, PORTAL_METHOD_CALL);
-            portal_msg_add_header(m, "path", line + 11);
-            g_core->send(g_core, m, r);
-            if (r->body)
-                write(fd, r->body, r->body_len > 0 ? r->body_len : strlen(r->body));
-            else
-                send_str(fd, "(trace failed)\n");
-            portal_msg_free(m); portal_resp_free(r);
-        }
-    /* --- Schedule commands --- */
-    } else if (strcmp(line, "schedule list") == 0) {
-        cmd_core_get(fd, "/scheduler/resources/tasks");
-    } else if (strncmp(line, "schedule ", 9) == 0) {
-        char name[64] = {0}, path[PORTAL_MAX_PATH_LEN] = {0};
-        int delay = 0;
-        if (sscanf(line + 9, "%63s %d %1023s", name, &delay, path) == 3) {
-            portal_msg_t *m = portal_msg_alloc();
-            portal_resp_t *r = portal_resp_alloc();
-            if (m && r) {
-                portal_msg_set_path(m, "/scheduler/functions/schedule");
-                portal_msg_set_method(m, PORTAL_METHOD_CALL);
-                portal_msg_add_header(m, "name", name);
-                char ds[16]; snprintf(ds, sizeof(ds), "%d", delay);
-                portal_msg_add_header(m, "delay", ds);
-                portal_msg_add_header(m, "path", path);
-                g_core->send(g_core, m, r);
-                send_str(fd, r->body ? r->body : "Scheduled\n");
-                portal_msg_free(m); portal_resp_free(r);
-            }
-        } else {
-            send_str(fd, "Usage: schedule <name> <delay_secs> <path>\n");
-        }
-    /* --- Process commands --- */
-    } else if (strncmp(line, "process exec ", 13) == 0) {
-        portal_msg_t *m = portal_msg_alloc();
-        portal_resp_t *r = portal_resp_alloc();
-        if (m && r) {
-            portal_msg_set_path(m, "/process/functions/exec");
-            portal_msg_set_method(m, PORTAL_METHOD_CALL);
-            portal_msg_add_header(m, "cmd", line + 13);
-            g_core->send(g_core, m, r);
-            if (r->body) {
-                write(fd, r->body, r->body_len > 0 ? r->body_len : strlen(r->body));
-                write(fd, "\n", 1);
-            } else {
-                send_str(fd, "(exec failed)\n");
-            }
-            portal_msg_free(m); portal_resp_free(r);
-        }
-    /* --- Validate commands --- */
-    } else if (strncmp(line, "validate email ", 15) == 0) {
-        portal_msg_t *m = portal_msg_alloc();
-        portal_resp_t *r = portal_resp_alloc();
-        if (m && r) {
-            portal_msg_set_path(m, "/validator/functions/email");
-            portal_msg_set_method(m, PORTAL_METHOD_CALL);
-            portal_msg_add_header(m, "value", line + 15);
-            g_core->send(g_core, m, r);
-            if (r->body) {
-                write(fd, r->body, r->body_len > 0 ? r->body_len : strlen(r->body));
-                write(fd, "\n", 1);
-            } else {
-                send_str(fd, "(validation failed)\n");
-            }
-            portal_msg_free(m); portal_resp_free(r);
-        }
-    } else if (strncmp(line, "validate ip ", 12) == 0) {
-        portal_msg_t *m = portal_msg_alloc();
-        portal_resp_t *r = portal_resp_alloc();
-        if (m && r) {
-            portal_msg_set_path(m, "/validator/functions/ip");
-            portal_msg_set_method(m, PORTAL_METHOD_CALL);
-            portal_msg_add_header(m, "value", line + 12);
-            g_core->send(g_core, m, r);
-            if (r->body) {
-                write(fd, r->body, r->body_len > 0 ? r->body_len : strlen(r->body));
-                write(fd, "\n", 1);
-            } else {
-                send_str(fd, "(validation failed)\n");
-            }
-            portal_msg_free(m); portal_resp_free(r);
-        }
-    /* --- Sysinfo & Metrics --- */
-    } else if (strcmp(line, "sysinfo") == 0) {
-        cmd_core_get(fd, "/sysinfo/resources/all");
-    } else if (strcmp(line, "metrics") == 0) {
-        cmd_core_get(fd, "/metrics/resources/all");
-    /* --- Compress commands --- */
-    } else if (strncmp(line, "compress gzip ", 14) == 0) {
-        portal_msg_t *m = portal_msg_alloc();
-        portal_resp_t *r = portal_resp_alloc();
-        if (m && r) {
-            portal_msg_set_path(m, "/compress/functions/gzip");
-            portal_msg_set_method(m, PORTAL_METHOD_CALL);
-            portal_msg_add_header(m, "data", line + 14);
-            g_core->send(g_core, m, r);
-            if (r->body) {
-                write(fd, r->body, r->body_len > 0 ? r->body_len : strlen(r->body));
-                write(fd, "\n", 1);
-            } else {
-                send_str(fd, "(compress failed)\n");
-            }
-            portal_msg_free(m); portal_resp_free(r);
-        }
-    } else if (strncmp(line, "compress xz ", 12) == 0) {
-        portal_msg_t *m = portal_msg_alloc();
-        portal_resp_t *r = portal_resp_alloc();
-        if (m && r) {
-            portal_msg_set_path(m, "/compress/functions/xz");
-            portal_msg_set_method(m, PORTAL_METHOD_CALL);
-            portal_msg_add_header(m, "data", line + 12);
-            g_core->send(g_core, m, r);
-            if (r->body) {
-                write(fd, r->body, r->body_len > 0 ? r->body_len : strlen(r->body));
-                write(fd, "\n", 1);
-            } else {
-                send_str(fd, "(compress failed)\n");
-            }
-            portal_msg_free(m); portal_resp_free(r);
-        }
-    /* --- Config commands --- */
-    } else if (strncmp(line, "config get ", 11) == 0) {
-        char mod[64] = {0}, key[256] = {0};
-        if (sscanf(line + 11, "%63s %255s", mod, key) == 2) {
-            portal_msg_t *m = portal_msg_alloc();
-            portal_resp_t *r = portal_resp_alloc();
-            if (m && r) {
-                portal_msg_set_path(m, "/core/config/get");
-                portal_msg_set_method(m, PORTAL_METHOD_GET);
-                portal_msg_add_header(m, "module", mod);
-                portal_msg_add_header(m, "key", key);
-                g_core->send(g_core, m, r);
-                if (r->body) send_str(fd, r->body);
-                else send_str(fd, "(not found)\n");
-                portal_msg_free(m); portal_resp_free(r);
-            }
-        } else {
-            send_str(fd, "Usage: config get <module> <key>\n");
-        }
-    } else if (strncmp(line, "config set ", 11) == 0) {
-        char mod[64] = {0}, key[256] = {0}, val[4096] = {0};
-        if (sscanf(line + 11, "%63s %255s %4095[^\n]", mod, key, val) >= 3) {
-            portal_msg_t *m = portal_msg_alloc();
-            portal_resp_t *r = portal_resp_alloc();
-            if (m && r) {
-                portal_msg_set_path(m, "/core/config/set");
-                portal_msg_set_method(m, PORTAL_METHOD_CALL);
-                portal_msg_add_header(m, "module", mod);
-                portal_msg_add_header(m, "key", key);
-                portal_msg_add_header(m, "value", val);
-                g_core->send(g_core, m, r);
-                send_str(fd, r->body ? r->body : "OK\n");
-                portal_msg_free(m); portal_resp_free(r);
-            }
-        } else {
-            send_str(fd, "Usage: config set <module> <key> <value>\n");
-        }
-    } else if (strncmp(line, "config list", 11) == 0) {
-        portal_msg_t *m = portal_msg_alloc();
-        portal_resp_t *r = portal_resp_alloc();
-        if (m && r) {
-            portal_msg_set_path(m, "/core/config/list");
-            portal_msg_set_method(m, PORTAL_METHOD_GET);
-            const char *mod = (strlen(line) > 12) ? line + 12 : NULL;
-            if (mod) portal_msg_add_header(m, "module", mod);
-            g_core->send(g_core, m, r);
-            if (r->body) send_str(fd, r->body);
-            else send_str(fd, "(empty)\n");
-            portal_msg_free(m); portal_resp_free(r);
-        }
-    /* --- IoT commands --- */
-    } else if (strcmp(line, "iot devices") == 0) {
-        cmd_core_get(fd, "/iot/resources/devices");
-    } else if (strncmp(line, "iot status", 10) == 0) {
-        if (strlen(line) > 11) {
-            portal_msg_t *m = portal_msg_alloc();
-            portal_resp_t *r = portal_resp_alloc();
-            if (m && r) {
-                portal_msg_set_path(m, "/iot/functions/status");
-                portal_msg_set_method(m, PORTAL_METHOD_GET);
-                portal_msg_add_header(m, "name", line + 11);
-                g_core->send(g_core, m, r);
-                if (r->body) send_str(fd, r->body);
-                else send_str(fd, "(no response)\n");
-                portal_msg_free(m); portal_resp_free(r);
-            }
-        } else {
-            cmd_core_get(fd, "/iot/functions/status");
-        }
-    } else if (strncmp(line, "iot discover ", 13) == 0) {
-        char subnet[48] = {0}, brand[32] = {0};
-        sscanf(line + 13, "%47s %31s", subnet, brand);
-        portal_msg_t *m = portal_msg_alloc();
-        portal_resp_t *r = portal_resp_alloc();
-        if (m && r) {
-            portal_msg_set_path(m, "/iot/functions/discover");
-            portal_msg_set_method(m, PORTAL_METHOD_CALL);
-            portal_msg_add_header(m, "subnet", subnet);
-            if (brand[0]) portal_msg_add_header(m, "brand", brand);
-            g_core->send(g_core, m, r);
-            if (r->body) send_str(fd, r->body);
-            else send_str(fd, "(no response)\n");
-            portal_msg_free(m); portal_resp_free(r);
-        }
-    } else if (strncmp(line, "iot on ", 7) == 0) {
-        portal_msg_t *m = portal_msg_alloc();
-        portal_resp_t *r = portal_resp_alloc();
-        if (m && r) {
-            portal_msg_set_path(m, "/iot/functions/on");
-            portal_msg_set_method(m, PORTAL_METHOD_CALL);
-            portal_msg_add_header(m, "name", line + 7);
-            g_core->send(g_core, m, r);
-            send_str(fd, r->body ? r->body : "OK\n");
-            portal_msg_free(m); portal_resp_free(r);
-        }
-    } else if (strncmp(line, "iot off ", 8) == 0) {
-        portal_msg_t *m = portal_msg_alloc();
-        portal_resp_t *r = portal_resp_alloc();
-        if (m && r) {
-            portal_msg_set_path(m, "/iot/functions/off");
-            portal_msg_set_method(m, PORTAL_METHOD_CALL);
-            portal_msg_add_header(m, "name", line + 8);
-            g_core->send(g_core, m, r);
-            send_str(fd, r->body ? r->body : "OK\n");
-            portal_msg_free(m); portal_resp_free(r);
-        }
-    } else if (strncmp(line, "iot toggle ", 11) == 0) {
-        portal_msg_t *m = portal_msg_alloc();
-        portal_resp_t *r = portal_resp_alloc();
-        if (m && r) {
-            portal_msg_set_path(m, "/iot/functions/toggle");
-            portal_msg_set_method(m, PORTAL_METHOD_CALL);
-            portal_msg_add_header(m, "name", line + 11);
-            g_core->send(g_core, m, r);
-            send_str(fd, r->body ? r->body : "OK\n");
-            portal_msg_free(m); portal_resp_free(r);
-        }
-    } else if (strncmp(line, "iot add ", 8) == 0) {
-        char name[64] = {0}, ip[48] = {0}, drv[16] = {0}, brn[16] = {0};
-        int parsed = sscanf(line + 8, "%63s %47s %15s %15s", name, ip, drv, brn);
-        if (parsed >= 2) {
-            portal_msg_t *m = portal_msg_alloc();
-            portal_resp_t *r = portal_resp_alloc();
-            if (m && r) {
-                portal_msg_set_path(m, "/iot/functions/add");
-                portal_msg_set_method(m, PORTAL_METHOD_CALL);
-                portal_msg_add_header(m, "name", name);
-                portal_msg_add_header(m, "ip", ip);
-                if (drv[0]) portal_msg_add_header(m, "driver", drv);
-                if (brn[0]) portal_msg_add_header(m, "brand", brn);
-                g_core->send(g_core, m, r);
-                send_str(fd, r->body ? r->body : "OK\n");
-                portal_msg_free(m); portal_resp_free(r);
-            }
-        } else {
-            send_str(fd, "Usage: iot add <name> <ip> [driver] [brand]\n");
-        }
-    } else if (strncmp(line, "iot remove ", 11) == 0) {
-        portal_msg_t *m = portal_msg_alloc();
-        portal_resp_t *r = portal_resp_alloc();
-        if (m && r) {
-            portal_msg_set_path(m, "/iot/functions/remove");
-            portal_msg_set_method(m, PORTAL_METHOD_CALL);
-            portal_msg_add_header(m, "name", line + 11);
-            g_core->send(g_core, m, r);
-            send_str(fd, r->body ? r->body : "OK\n");
-            portal_msg_free(m); portal_resp_free(r);
-        }
-    } else if (strcmp(line, "iot refresh") == 0) {
-        portal_msg_t *m = portal_msg_alloc();
-        portal_resp_t *r = portal_resp_alloc();
-        if (m && r) {
-            portal_msg_set_path(m, "/iot/functions/refresh");
-            portal_msg_set_method(m, PORTAL_METHOD_CALL);
-            g_core->send(g_core, m, r);
-            if (r->body)
-                write(fd, r->body, r->body_len > 0 ? r->body_len : strlen(r->body));
-            else
-                send_str(fd, "(refresh failed)\n");
-            portal_msg_free(m); portal_resp_free(r);
-        }
+    /* cron commands: now registered by mod_cron via portal_cli_register */
+    /* health/uptime commands: now registered by mod_health via portal_cli_register */
+    /* json commands: now registered by mod_json via portal_cli_register */
+    /* curl commands: now registered by mod_http_client via portal_cli_register */
+    /* kv commands: now registered by mod_kv via portal_cli_register */
+    /* firewall commands: now registered by mod_firewall via portal_cli_register */
+    /* backup commands: now registered by mod_backup via portal_cli_register */
+    /* dns commands: now registered by mod_dns via portal_cli_register */
+    /* node/ping/tracert commands: now registered by mod_node via portal_cli_register */
+    /* schedule commands: now registered by mod_scheduler via portal_cli_register */
+    /* process commands: now registered by mod_process via portal_cli_register */
+    /* validate commands: now registered by mod_validator via portal_cli_register */
+    /* sysinfo/metrics commands: now registered by mod_sysinfo/mod_metrics via portal_cli_register */
+    /* compress commands: now registered by mod_gzip/mod_xz via portal_cli_register */
+    /* config commands: now registered by mod_cli via portal_cli_register (below) */
+    /* iot commands: now registered by mod_iot via portal_cli_register */
+    /* All above commands dispatched via the registered-command fallback at the end of this chain. */
     } else if (strcmp(line, "shell") == 0 || strncmp(line, "shell ", 6) == 0) {
         /* Enter PTY shell mode: "shell" = local, "shell <peer>" = remote */
         cli_client_t *sc = find_client(fd);
@@ -3085,6 +2433,81 @@ static void on_new_connection(int fd, uint32_t events, void *userdata)
 
 /* --- Module lifecycle --- */
 
+/* ── Config CLI commands (core config, stays in mod_cli) ── */
+
+static int cli_config_get(portal_core_t *core, int fd,
+                           const char *line, const char *args)
+{
+    (void)line;
+    char mod[64] = {0}, key[256] = {0};
+    if (!args || sscanf(args, "%63s %255s", mod, key) != 2) {
+        send_str(fd, "Usage: config get <module> <key>\n");
+        return -1;
+    }
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (m && r) {
+        portal_msg_set_path(m, "/core/config/get");
+        portal_msg_set_method(m, PORTAL_METHOD_GET);
+        portal_msg_add_header(m, "module", mod);
+        portal_msg_add_header(m, "key", key);
+        core->send(core, m, r);
+        if (r->body) send_str(fd, r->body);
+        else send_str(fd, "(not found)\n");
+        portal_msg_free(m); portal_resp_free(r);
+    }
+    return 0;
+}
+
+static int cli_config_set(portal_core_t *core, int fd,
+                           const char *line, const char *args)
+{
+    (void)line;
+    char mod[64] = {0}, key[256] = {0}, val[4096] = {0};
+    if (!args || sscanf(args, "%63s %255s %4095[^\n]", mod, key, val) < 3) {
+        send_str(fd, "Usage: config set <module> <key> <value>\n");
+        return -1;
+    }
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (m && r) {
+        portal_msg_set_path(m, "/core/config/set");
+        portal_msg_set_method(m, PORTAL_METHOD_CALL);
+        portal_msg_add_header(m, "module", mod);
+        portal_msg_add_header(m, "key", key);
+        portal_msg_add_header(m, "value", val);
+        core->send(core, m, r);
+        send_str(fd, r->body ? r->body : "OK\n");
+        portal_msg_free(m); portal_resp_free(r);
+    }
+    return 0;
+}
+
+static int cli_config_list(portal_core_t *core, int fd,
+                            const char *line, const char *args)
+{
+    (void)line;
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (m && r) {
+        portal_msg_set_path(m, "/core/config/list");
+        portal_msg_set_method(m, PORTAL_METHOD_GET);
+        if (args && *args) portal_msg_add_header(m, "module", args);
+        core->send(core, m, r);
+        if (r->body) send_str(fd, r->body);
+        else send_str(fd, "(empty)\n");
+        portal_msg_free(m); portal_resp_free(r);
+    }
+    return 0;
+}
+
+static portal_cli_entry_t config_cli_cmds[] = {
+    { .words = "config get",  .handler = cli_config_get,  .summary = "Get config value: <module> <key>" },
+    { .words = "config set",  .handler = cli_config_set,  .summary = "Set config value: <module> <key> <value>" },
+    { .words = "config list", .handler = cli_config_list, .summary = "List config entries [module]" },
+    { .words = NULL }
+};
+
 int portal_module_load(portal_core_t *core)
 {
     g_core = core;
@@ -3136,6 +2559,10 @@ int portal_module_load(portal_core_t *core)
     core->path_register(core, "/cli/command", "cli");
     core->path_set_access(core, "/cli/command", PORTAL_ACCESS_RW);
 
+    /* Register config CLI commands (core config, stays in mod_cli) */
+    for (int i = 0; config_cli_cmds[i].words; i++)
+        portal_cli_register(core, &config_cli_cmds[i], "cli");
+
     core->log(core, PORTAL_LOG_INFO, "cli", "Listening on %s", g_socket_path);
     return PORTAL_MODULE_OK;
 }
@@ -3163,6 +2590,7 @@ int portal_module_unload(portal_core_t *core)
     unlink(g_socket_path);
 
     core->path_unregister(core, "/cli/command");
+    portal_cli_unregister_module(core, "cli");
     core->log(core, PORTAL_LOG_INFO, "cli", "CLI module unloaded");
 
     g_core = NULL;

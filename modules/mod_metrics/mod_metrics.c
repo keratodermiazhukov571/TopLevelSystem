@@ -180,6 +180,33 @@ static void get_load_info(char *buf, size_t buflen)
     (void)off;
 }
 
+/* ── CLI command handlers (registered via portal_cli_register) ── */
+
+static void cli_get_path(int fd, const char *path)
+{
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (!m || !r) return;
+    portal_msg_set_path(m, path);
+    portal_msg_set_method(m, PORTAL_METHOD_GET);
+    g_core->send(g_core, m, r);
+    if (r->body) write(fd, r->body, r->body_len);
+    portal_msg_free(m); portal_resp_free(r);
+}
+
+static int cli_metrics(portal_core_t *core, int fd,
+                        const char *line, const char *args)
+{
+    (void)core; (void)line; (void)args;
+    cli_get_path(fd, "/metrics/resources/all");
+    return 0;
+}
+
+static portal_cli_entry_t metrics_cli_cmds[] = {
+    { .words = "metrics", .handler = cli_metrics, .summary = "System metrics (CPU, memory, disk, load)" },
+    { .words = NULL }
+};
+
 int portal_module_load(portal_core_t *core)
 {
     g_core = core;
@@ -203,6 +230,10 @@ int portal_module_load(portal_core_t *core)
     core->path_register(core, "/metrics/resources/all", "metrics");
     core->path_set_access(core, "/metrics/resources/all", PORTAL_ACCESS_READ);
 
+    /* Register CLI commands */
+    for (int i = 0; metrics_cli_cmds[i].words; i++)
+        portal_cli_register(core, &metrics_cli_cmds[i], "metrics");
+
     core->log(core, PORTAL_LOG_INFO, "metrics", "System metrics ready");
     return PORTAL_MODULE_OK;
 }
@@ -215,6 +246,7 @@ int portal_module_unload(portal_core_t *core)
     core->path_unregister(core, "/metrics/resources/disk");
     core->path_unregister(core, "/metrics/resources/load");
     core->path_unregister(core, "/metrics/resources/all");
+    portal_cli_unregister_module(core, "metrics");
     core->log(core, PORTAL_LOG_INFO, "metrics", "Metrics unloaded");
     g_core = NULL;
     return PORTAL_MODULE_OK;

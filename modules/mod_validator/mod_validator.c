@@ -32,6 +32,7 @@
 #include <ctype.h>
 #include <arpa/inet.h>
 #include <regex.h>
+#include <unistd.h>
 #include "portal/portal.h"
 
 static portal_core_t *g_core = NULL;
@@ -146,6 +147,113 @@ static int validate_hostname(const char *host)
     return 1;
 }
 
+/* ── CLI command handlers (registered via portal_cli_register) ── */
+
+static void cli_send(int fd, const char *s)
+{
+    if (s) write(fd, s, strlen(s));
+}
+
+static int cli_validate_email(portal_core_t *core, int fd,
+                               const char *line, const char *args)
+{
+    (void)line;
+    if (!args || !*args) { cli_send(fd, "Usage: validate email <value>\n"); return -1; }
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (m && r) {
+        portal_msg_set_path(m, "/validator/functions/email");
+        portal_msg_set_method(m, PORTAL_METHOD_CALL);
+        portal_msg_add_header(m, "value", args);
+        core->send(core, m, r);
+        if (r->body) {
+            write(fd, r->body, r->body_len > 0 ? r->body_len : strlen(r->body));
+            write(fd, "\n", 1);
+        } else {
+            cli_send(fd, "(validation failed)\n");
+        }
+        portal_msg_free(m); portal_resp_free(r);
+    }
+    return 0;
+}
+
+static int cli_validate_ip(portal_core_t *core, int fd,
+                            const char *line, const char *args)
+{
+    (void)line;
+    if (!args || !*args) { cli_send(fd, "Usage: validate ip <value>\n"); return -1; }
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (m && r) {
+        portal_msg_set_path(m, "/validator/functions/ip");
+        portal_msg_set_method(m, PORTAL_METHOD_CALL);
+        portal_msg_add_header(m, "value", args);
+        core->send(core, m, r);
+        if (r->body) {
+            write(fd, r->body, r->body_len > 0 ? r->body_len : strlen(r->body));
+            write(fd, "\n", 1);
+        } else {
+            cli_send(fd, "(validation failed)\n");
+        }
+        portal_msg_free(m); portal_resp_free(r);
+    }
+    return 0;
+}
+
+static int cli_validate_url(portal_core_t *core, int fd,
+                             const char *line, const char *args)
+{
+    (void)line;
+    if (!args || !*args) { cli_send(fd, "Usage: validate url <value>\n"); return -1; }
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (m && r) {
+        portal_msg_set_path(m, "/validator/functions/url");
+        portal_msg_set_method(m, PORTAL_METHOD_CALL);
+        portal_msg_add_header(m, "value", args);
+        core->send(core, m, r);
+        if (r->body) {
+            write(fd, r->body, r->body_len > 0 ? r->body_len : strlen(r->body));
+            write(fd, "\n", 1);
+        } else {
+            cli_send(fd, "(validation failed)\n");
+        }
+        portal_msg_free(m); portal_resp_free(r);
+    }
+    return 0;
+}
+
+static int cli_validate_hostname(portal_core_t *core, int fd,
+                                  const char *line, const char *args)
+{
+    (void)line;
+    if (!args || !*args) { cli_send(fd, "Usage: validate hostname <value>\n"); return -1; }
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (m && r) {
+        portal_msg_set_path(m, "/validator/functions/hostname");
+        portal_msg_set_method(m, PORTAL_METHOD_CALL);
+        portal_msg_add_header(m, "value", args);
+        core->send(core, m, r);
+        if (r->body) {
+            write(fd, r->body, r->body_len > 0 ? r->body_len : strlen(r->body));
+            write(fd, "\n", 1);
+        } else {
+            cli_send(fd, "(validation failed)\n");
+        }
+        portal_msg_free(m); portal_resp_free(r);
+    }
+    return 0;
+}
+
+static portal_cli_entry_t validator_cli_cmds[] = {
+    { .words = "validate email",    .handler = cli_validate_email,    .summary = "Validate email address" },
+    { .words = "validate ip",       .handler = cli_validate_ip,       .summary = "Validate IP address" },
+    { .words = "validate url",      .handler = cli_validate_url,      .summary = "Validate URL" },
+    { .words = "validate hostname", .handler = cli_validate_hostname, .summary = "Validate hostname" },
+    { .words = NULL }
+};
+
 int portal_module_load(portal_core_t *core)
 {
     g_core = core;
@@ -176,6 +284,10 @@ int portal_module_load(portal_core_t *core)
     core->path_set_access(core, "/validator/functions/hostname", PORTAL_ACCESS_RW);
     core->path_set_description(core, "/validator/functions/hostname", "Validate hostname. Header: value");
 
+    /* Register CLI commands */
+    for (int i = 0; validator_cli_cmds[i].words; i++)
+        portal_cli_register(core, &validator_cli_cmds[i], "validator");
+
     core->log(core, PORTAL_LOG_INFO, "validator", "Input validator ready");
     return PORTAL_MODULE_OK;
 }
@@ -190,6 +302,7 @@ int portal_module_unload(portal_core_t *core)
     core->path_unregister(core, "/validator/functions/number");
     core->path_unregister(core, "/validator/functions/regex");
     core->path_unregister(core, "/validator/functions/hostname");
+    portal_cli_unregister_module(core, "validator");
     core->log(core, PORTAL_LOG_INFO, "validator", "Validator unloaded");
     g_core = NULL;
     return PORTAL_MODULE_OK;

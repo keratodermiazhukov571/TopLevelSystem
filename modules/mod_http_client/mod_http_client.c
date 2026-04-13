@@ -207,6 +207,41 @@ static int http_request(const char *method, const char *url,
     return 0;
 }
 
+/* ── CLI command handlers (registered via portal_cli_register) ── */
+
+static void cli_send(int fd, const char *s)
+{
+    if (s) write(fd, s, strlen(s));
+}
+
+static int cli_curl(portal_core_t *core, int fd,
+                     const char *line, const char *args)
+{
+    (void)line;
+    if (!args || !*args) { cli_send(fd, "Usage: curl <url>\n"); return -1; }
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (m && r) {
+        portal_msg_set_path(m, "/httpc/functions/get");
+        portal_msg_set_method(m, PORTAL_METHOD_CALL);
+        portal_msg_add_header(m, "url", args);
+        core->send(core, m, r);
+        if (r->body) {
+            write(fd, r->body, r->body_len > 0 ? r->body_len : strlen(r->body));
+            write(fd, "\n", 1);
+        } else {
+            cli_send(fd, "(request failed)\n");
+        }
+        portal_msg_free(m); portal_resp_free(r);
+    }
+    return 0;
+}
+
+static portal_cli_entry_t httpc_cli_cmds[] = {
+    { .words = "curl", .handler = cli_curl, .summary = "HTTP GET external URL" },
+    { .words = NULL }
+};
+
 /* --- Module lifecycle --- */
 
 int portal_module_load(portal_core_t *core)
@@ -230,6 +265,10 @@ int portal_module_load(portal_core_t *core)
     core->path_set_access(core, "/httpc/functions/post", PORTAL_ACCESS_RW);
     core->path_set_description(core, "/httpc/functions/post", "HTTP POST external URL. Header: url. Body: payload");
 
+    /* Register CLI commands */
+    for (int i = 0; httpc_cli_cmds[i].words; i++)
+        portal_cli_register(core, &httpc_cli_cmds[i], "http_client");
+
     core->log(core, PORTAL_LOG_INFO, "httpc",
               "HTTP client ready (timeout: %ds)", g_timeout);
     return PORTAL_MODULE_OK;
@@ -241,6 +280,7 @@ int portal_module_unload(portal_core_t *core)
     core->path_unregister(core, "/httpc/resources/status");
     core->path_unregister(core, "/httpc/functions/get");
     core->path_unregister(core, "/httpc/functions/post");
+    portal_cli_unregister_module(core, "http_client");
     g_core = NULL;
     return PORTAL_MODULE_OK;
 }

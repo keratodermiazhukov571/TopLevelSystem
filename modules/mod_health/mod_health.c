@@ -30,6 +30,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 #include "portal/portal.h"
 
 static portal_core_t *g_core = NULL;
@@ -41,6 +42,61 @@ static portal_module_info_t info = {
     .soft_deps = NULL
 };
 portal_module_info_t *portal_module_info(void) { return &info; }
+
+/* ── CLI command handlers (registered via portal_cli_register) ── */
+
+static void cli_get_path(int fd, const char *path)
+{
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (!m || !r) return;
+    portal_msg_set_path(m, path);
+    portal_msg_set_method(m, PORTAL_METHOD_GET);
+    g_core->send(g_core, m, r);
+    if (r->body) write(fd, r->body, r->body_len);
+    portal_msg_free(m); portal_resp_free(r);
+}
+
+static int cli_health_status(portal_core_t *core, int fd,
+                              const char *line, const char *args)
+{
+    (void)core; (void)line; (void)args;
+    cli_get_path(fd, "/health/resources/status");
+    return 0;
+}
+
+static int cli_health_live(portal_core_t *core, int fd,
+                            const char *line, const char *args)
+{
+    (void)core; (void)line; (void)args;
+    cli_get_path(fd, "/health/resources/live");
+    return 0;
+}
+
+static int cli_health_ready(portal_core_t *core, int fd,
+                             const char *line, const char *args)
+{
+    (void)core; (void)line; (void)args;
+    cli_get_path(fd, "/health/resources/ready");
+    return 0;
+}
+
+static int cli_uptime(portal_core_t *core, int fd,
+                       const char *line, const char *args)
+{
+    (void)core; (void)line; (void)args;
+    cli_get_path(fd, "/health/resources/uptime");
+    return 0;
+}
+
+static portal_cli_entry_t health_cli_cmds[] = {
+    { .words = "health status", .handler = cli_health_status, .summary = "Detailed health status" },
+    { .words = "health live",   .handler = cli_health_live,   .summary = "Liveness probe" },
+    { .words = "health ready",  .handler = cli_health_ready,  .summary = "Readiness probe" },
+    { .words = "health",        .handler = cli_health_status, .summary = "Health status overview" },
+    { .words = "uptime",        .handler = cli_uptime,        .summary = "System uptime" },
+    { .words = NULL }
+};
 
 int portal_module_load(portal_core_t *core)
 {
@@ -60,6 +116,10 @@ int portal_module_load(portal_core_t *core)
     core->path_set_access(core, "/health/resources/uptime", PORTAL_ACCESS_READ);
     core->path_set_description(core, "/health/resources/uptime", "Seconds since Portal started");
 
+    /* Register CLI commands */
+    for (int i = 0; health_cli_cmds[i].words; i++)
+        portal_cli_register(core, &health_cli_cmds[i], "health");
+
     core->log(core, PORTAL_LOG_INFO, "health", "Health checks ready");
     return PORTAL_MODULE_OK;
 }
@@ -70,6 +130,7 @@ int portal_module_unload(portal_core_t *core)
     core->path_unregister(core, "/health/resources/ready");
     core->path_unregister(core, "/health/resources/status");
     core->path_unregister(core, "/health/resources/uptime");
+    portal_cli_unregister_module(core, "health");
     g_core = NULL;
     return PORTAL_MODULE_OK;
 }
