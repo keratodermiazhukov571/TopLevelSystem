@@ -1606,6 +1606,8 @@ static void editor_redraw(int fd, cli_client_t *c)
 static void editor_history_add(cli_line_editor_t *ed, const char *line)
 {
     if (!line[0]) return;  /* skip empty */
+    /* Never store passwords in history */
+    if (strncmp(line, "login ", 6) == 0) return;
     /* Don't duplicate last entry */
     if (ed->hist_count > 0 &&
         strcmp(ed->history[(ed->hist_count - 1) % CLI_MAX_HISTORY], line) == 0)

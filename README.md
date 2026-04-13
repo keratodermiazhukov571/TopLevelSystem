@@ -1265,7 +1265,7 @@ portal/
 └── Makefile                     Build system (52 modules)
 ```
 
-All 88 source files have descriptive header comments.
+All 91 source files have descriptive header comments.
 
 ---
 
