@@ -378,6 +378,7 @@ Before releasing a module:
 - [ ] `event_emit()` called on every state change (set, del, create, send, etc.)
 - [ ] Events registered with `event_register()` in `load()`
 - [ ] CLI commands available for all module resources and functions
+- [ ] CLI commands registered via `portal_cli_register()` in `load()`, unregistered in `unload()`
 
 **Documentation:**
 - [ ] Header comment on source file describing purpose

@@ -742,10 +742,55 @@ portal> module list
 8. **Paths start with `/module_name/`.** Convention for namespace isolation.
 9. **Use labels for access control.** Restrict sensitive paths with `path_add_label()`.
 10. **Body format is your choice.** Text, JSON, binary, protobuf — whatever fits. Document it.
+11. **Register CLI commands.** Use `portal_cli_register()` for module-specific CLI commands. Unregister in `unload()`.
 
 ---
 
-## 13. Remote Shell
+## 13. CLI Command Registration
+
+Modules can register their own CLI commands (Asterisk-inspired pattern). Include `portal/cli.h` (auto-included via `portal/portal.h`).
+
+```c
+#include "portal/portal.h"
+
+/* Handler: called when the command matches */
+static int cli_mymod_status(portal_core_t *core, int fd,
+                             const char *line, const char *args)
+{
+    (void)core; (void)line; (void)args;
+    const char *msg = "MyMod is running\n";
+    write(fd, msg, strlen(msg));
+    return 0;
+}
+
+/* Command table */
+static portal_cli_entry_t mymod_cli[] = {
+    { .words = "mymod status",  .handler = cli_mymod_status,  .summary = "Show status" },
+    { .words = "mymod reset",   .handler = cli_mymod_reset,   .summary = "Reset module" },
+    { .words = NULL }
+};
+
+/* Register in load */
+int portal_module_load(portal_core_t *core)
+{
+    for (int i = 0; mymod_cli[i].words; i++)
+        portal_cli_register(core, &mymod_cli[i], "mymod");
+    return PORTAL_MODULE_OK;
+}
+
+/* Unregister in unload */
+int portal_module_unload(portal_core_t *core)
+{
+    portal_cli_unregister_module(core, "mymod");
+    return PORTAL_MODULE_OK;
+}
+```
+
+The `.words` field uses space-separated word patterns. The `args` parameter in the handler points to everything after the matched words.
+
+---
+
+## 14. Remote Shell
 
 Portal provides SSH-like interactive terminal access to any federated peer via dedicated relay threads.
 
