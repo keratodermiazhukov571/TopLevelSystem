@@ -32,6 +32,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 #include <pthread.h>
 #include "portal/portal.h"
 
@@ -188,6 +189,141 @@ static const char *get_hdr(const portal_msg_t *msg, const char *key)
 
 /* --- Module lifecycle --- */
 
+/* ── CLI command handlers (registered via portal_cli_register) ── */
+
+static void cli_send(int fd, const char *s)
+{
+    if (s) write(fd, s, strlen(s));
+}
+
+static void cli_get_path(int fd, const char *path)
+{
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (!m || !r) return;
+    portal_msg_set_path(m, path);
+    portal_msg_set_method(m, PORTAL_METHOD_GET);
+    g_core->send(g_core, m, r);
+    if (r->body) write(fd, r->body, r->body_len);
+    portal_msg_free(m); portal_resp_free(r);
+}
+
+static int cli_cache_get(portal_core_t *core, int fd,
+                          const char *line, const char *args)
+{
+    (void)core; (void)line;
+    if (!args || !*args) { cli_send(fd, "Usage: cache get <key>\n"); return -1; }
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (m && r) {
+        portal_msg_set_path(m, "/cache/functions/get");
+        portal_msg_set_method(m, PORTAL_METHOD_CALL);
+        portal_msg_add_header(m, "key", args);
+        core->send(core, m, r);
+        if (r->status == PORTAL_OK && r->body) {
+            write(fd, r->body, r->body_len);
+            write(fd, "\n", 1);
+        } else {
+            cli_send(fd, "(not found)\n");
+        }
+        portal_msg_free(m); portal_resp_free(r);
+    }
+    return 0;
+}
+
+static int cli_cache_set(portal_core_t *core, int fd,
+                          const char *line, const char *args)
+{
+    (void)line;
+    char k[128] = {0}, v[1024] = {0};
+    if (!args || sscanf(args, "%127s %1023[^\n]", k, v) < 2) {
+        cli_send(fd, "Usage: cache set <key> <value> [ttl]\n");
+        return -1;
+    }
+    int ttl = 0;
+    char *last_space = strrchr(v, ' ');
+    if (last_space && atoi(last_space + 1) > 0) {
+        ttl = atoi(last_space + 1);
+        *last_space = '\0';
+    }
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (m && r) {
+        portal_msg_set_path(m, "/cache/functions/set");
+        portal_msg_set_method(m, PORTAL_METHOD_CALL);
+        portal_msg_add_header(m, "key", k);
+        portal_msg_add_header(m, "value", v);
+        if (ttl > 0) {
+            char ts[16]; snprintf(ts, sizeof(ts), "%d", ttl);
+            portal_msg_add_header(m, "ttl", ts);
+        }
+        core->send(core, m, r);
+        cli_send(fd, r->body ? r->body : "Error\n");
+        portal_msg_free(m); portal_resp_free(r);
+    }
+    return 0;
+}
+
+static int cli_cache_del(portal_core_t *core, int fd,
+                          const char *line, const char *args)
+{
+    (void)line;
+    if (!args || !*args) { cli_send(fd, "Usage: cache del <key>\n"); return -1; }
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (m && r) {
+        portal_msg_set_path(m, "/cache/functions/del");
+        portal_msg_set_method(m, PORTAL_METHOD_CALL);
+        portal_msg_add_header(m, "key", args);
+        core->send(core, m, r);
+        cli_send(fd, r->body ? r->body : "Deleted\n");
+        portal_msg_free(m); portal_resp_free(r);
+    }
+    return 0;
+}
+
+static int cli_cache_keys(portal_core_t *core, int fd,
+                           const char *line, const char *args)
+{
+    (void)core; (void)line; (void)args;
+    cli_get_path(fd, "/cache/resources/keys");
+    return 0;
+}
+
+static int cli_cache_status(portal_core_t *core, int fd,
+                             const char *line, const char *args)
+{
+    (void)core; (void)line; (void)args;
+    cli_get_path(fd, "/cache/resources/status");
+    return 0;
+}
+
+static int cli_cache_flush(portal_core_t *core, int fd,
+                            const char *line, const char *args)
+{
+    (void)line; (void)args;
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (m && r) {
+        portal_msg_set_path(m, "/cache/functions/flush");
+        portal_msg_set_method(m, PORTAL_METHOD_CALL);
+        core->send(core, m, r);
+        cli_send(fd, r->body ? r->body : "Flushed\n");
+        portal_msg_free(m); portal_resp_free(r);
+    }
+    return 0;
+}
+
+static portal_cli_entry_t cache_cli_cmds[] = {
+    { .words = "cache get",     .handler = cli_cache_get,    .summary = "Get cache value by key" },
+    { .words = "cache set",     .handler = cli_cache_set,    .summary = "Set cache key value [ttl]" },
+    { .words = "cache del",     .handler = cli_cache_del,    .summary = "Delete cache key" },
+    { .words = "cache keys",    .handler = cli_cache_keys,   .summary = "List all cache keys" },
+    { .words = "cache status",  .handler = cli_cache_status, .summary = "Cache statistics" },
+    { .words = "cache flush",   .handler = cli_cache_flush,  .summary = "Clear all cache entries" },
+    { .words = NULL }
+};
+
 int portal_module_load(portal_core_t *core)
 {
     g_core = core;
@@ -218,6 +354,10 @@ int portal_module_load(portal_core_t *core)
     core->path_set_access(core, "/cache/functions/flush", PORTAL_ACCESS_RW);
     core->path_set_description(core, "/cache/functions/flush", "Clear all cache entries");
 
+    /* Register CLI commands */
+    for (int i = 0; cache_cli_cmds[i].words; i++)
+        portal_cli_register(core, &cache_cli_cmds[i], "cache");
+
     core->log(core, PORTAL_LOG_INFO, "cache",
               "Cache ready (max: %d entries)", g_max);
     return PORTAL_MODULE_OK;
@@ -233,6 +373,7 @@ int portal_module_unload(portal_core_t *core)
     core->path_unregister(core, "/cache/functions/set");
     core->path_unregister(core, "/cache/functions/del");
     core->path_unregister(core, "/cache/functions/flush");
+    portal_cli_unregister_module(core, "cache");
     core->log(core, PORTAL_LOG_INFO, "cache", "Cache unloaded");
     g_core = NULL;
     return PORTAL_MODULE_OK;

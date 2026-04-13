@@ -1469,76 +1469,8 @@ static void handle_command(int fd, char *line)
             portal_msg_free(m); portal_resp_free(r);
         }
     /* --- Cache commands --- */
-    } else if (strncmp(line, "cache set ", 10) == 0) {
-        /* cache set key value [ttl] */
-        char k[128] = {0}, v[1024] = {0};
-        int ttl = 0;
-        if (sscanf(line + 10, "%127s %1023[^\n]", k, v) >= 2) {
-            /* Check for ttl at end: "value 60" */
-            char *last_space = strrchr(v, ' ');
-            if (last_space && atoi(last_space + 1) > 0) {
-                ttl = atoi(last_space + 1);
-                *last_space = '\0';
-            }
-            portal_msg_t *m = portal_msg_alloc();
-            portal_resp_t *r = portal_resp_alloc();
-            if (m && r) {
-                portal_msg_set_path(m, "/cache/functions/set");
-                portal_msg_set_method(m, PORTAL_METHOD_CALL);
-                portal_msg_add_header(m, "key", k);
-                portal_msg_add_header(m, "value", v);
-                if (ttl > 0) {
-                    char ts[16]; snprintf(ts, sizeof(ts), "%d", ttl);
-                    portal_msg_add_header(m, "ttl", ts);
-                }
-                g_core->send(g_core, m, r);
-                send_str(fd, r->body ? r->body : "Error\n");
-                portal_msg_free(m); portal_resp_free(r);
-            }
-        } else {
-            send_str(fd, "Usage: cache set <key> <value> [ttl]\n");
-        }
-    } else if (strncmp(line, "cache get ", 10) == 0) {
-        portal_msg_t *m = portal_msg_alloc();
-        portal_resp_t *r = portal_resp_alloc();
-        if (m && r) {
-            portal_msg_set_path(m, "/cache/functions/get");
-            portal_msg_set_method(m, PORTAL_METHOD_CALL);
-            portal_msg_add_header(m, "key", line + 10);
-            g_core->send(g_core, m, r);
-            if (r->status == PORTAL_OK && r->body) {
-                write(fd, r->body, r->body_len);
-                write(fd, "\n", 1);
-            } else {
-                send_str(fd, "(not found)\n");
-            }
-            portal_msg_free(m); portal_resp_free(r);
-        }
-    } else if (strncmp(line, "cache del ", 10) == 0) {
-        portal_msg_t *m = portal_msg_alloc();
-        portal_resp_t *r = portal_resp_alloc();
-        if (m && r) {
-            portal_msg_set_path(m, "/cache/functions/del");
-            portal_msg_set_method(m, PORTAL_METHOD_CALL);
-            portal_msg_add_header(m, "key", line + 10);
-            g_core->send(g_core, m, r);
-            send_str(fd, r->body ? r->body : "Deleted\n");
-            portal_msg_free(m); portal_resp_free(r);
-        }
-    } else if (strcmp(line, "cache keys") == 0) {
-        cmd_core_get(fd, "/cache/resources/keys");
-    } else if (strcmp(line, "cache status") == 0) {
-        cmd_core_get(fd, "/cache/resources/status");
-    } else if (strcmp(line, "cache flush") == 0) {
-        portal_msg_t *m = portal_msg_alloc();
-        portal_resp_t *r = portal_resp_alloc();
-        if (m && r) {
-            portal_msg_set_path(m, "/cache/functions/flush");
-            portal_msg_set_method(m, PORTAL_METHOD_CALL);
-            g_core->send(g_core, m, r);
-            send_str(fd, r->body ? r->body : "Flushed\n");
-            portal_msg_free(m); portal_resp_free(r);
-        }
+    /* cache commands: now registered by mod_cache via portal_cli_register.
+     * Dispatched via the registered-command fallback at the end of this chain. */
     /* --- Cron commands --- */
     } else if (strcmp(line, "cron status") == 0) {
         cmd_core_get(fd, "/cron/resources/status");
