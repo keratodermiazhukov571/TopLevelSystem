@@ -384,7 +384,7 @@ function pgTerm(){
 }
 function TW(t,c){const o=$('term-output');if(!o)return;const s=document.createElement('span');s.className=c||'res';s.textContent=t;o.appendChild(s);o.scrollTop=o.scrollHeight}
 function nodeApi(p,m){
-  /* If CWD is a remote node (e.g. /ssip888), prefix API calls */
+  /* If CWD is a remote node (e.g. /mynode), prefix API calls */
   if(TCW.length>1){
     const node=TCW.split('/')[1];
     if(node&&mods.every(x=>x.n!==node))return api('/'+node+p,m);

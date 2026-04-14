@@ -206,9 +206,9 @@ static int             g_peers_cap = 0;
 static int             g_peer_count = 0;
 
 /* Outbound gating: if g_defer_event is set, mod_node does not initiate
- * outbound connects until that event fires. Lets another module (e.g.
- * mod_ssip) delay federation until device identity is ready — avoids
- * pre-registration handshake timeouts on the hub. */
+ * outbound connects until that event fires. Lets another module delay
+ * federation until local identity is ready — avoids premature handshake
+ * timeouts on the remote side. */
 static char            g_defer_event[256] = "";
 static int             g_outbound_enabled = 1;
 
@@ -2402,8 +2402,7 @@ read_more:
      * the same order the requests were sent (FIFO). Single-threaded mod_node
      * dispatch ensures the peer never interleaves a new request with a
      * response on the same conn — known latent limitation: a handler that
-     * recursively core->sends to the same peer could break FIFO order.
-     * Not an active bug in SSIP's flow. */
+     * recursively core->sends to the same peer could break FIFO order. */
 
     if (rx->pending_head) {
         /* Response match to the oldest pending request on this conn */

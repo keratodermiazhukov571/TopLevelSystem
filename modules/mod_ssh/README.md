@@ -34,9 +34,9 @@ portal:/> status
 Portal v1.0.0
 Status: running
 Modules loaded: 50
-portal:/> shell ssip888
-Connected to ssip888 (Ctrl-] to disconnect)
-root@ssipdev:~# htop
+portal:/> shell mynode
+Connected to mynode (Ctrl-] to disconnect)
+root@mynode:~# htop
 ```
 
 ## How It Works

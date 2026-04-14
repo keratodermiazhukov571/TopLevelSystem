@@ -22,11 +22,11 @@ SSH-quality interactive terminal access to any federated Portal peer. Uses real 
 ## Quick Start
 
 ```
-portal:/> shell ssip888
-Connected to ssip888 (Ctrl-] to disconnect)
-root@ssipdev:~# htop
+portal:/> shell mynode
+Connected to mynode (Ctrl-] to disconnect)
+root@mynode:~# htop
 (full interactive display, fills entire terminal)
-root@ssipdev:~# ^]
+root@mynode:~# ^]
 Disconnected
 portal:/>
 ```
@@ -107,7 +107,7 @@ curl -s -u root:<pass> -X PUT "http://host:8080/api/shell/functions/resize?sessi
 curl -s -u root:<pass> -X PUT "http://host:8080/api/shell/functions/close?session=$SID"
 
 # Remote via federation
-curl -u root:<pass> -X PUT "http://hub:8090/api/ssip888/shell/functions/exec?cmd=uptime"
+curl -u root:<pass> -X PUT "http://hub:8080/api/mynode/shell/functions/exec?cmd=uptime"
 ```
 
 ## CLI Integration
@@ -116,8 +116,8 @@ The `shell` command in mod_cli provides the interactive experience using dedicat
 
 ```
 portal:/> shell              # Local shell (forkpty + relay thread)
-portal:/> shell ssip888      # Remote shell via /node/functions/shell
-portal:/> shell ssip-hub     # Shell into the hub
+portal:/> shell mynode      # Remote shell via /node/functions/shell
+portal:/> shell hub          # Shell into a hub peer
 ```
 
 Features:

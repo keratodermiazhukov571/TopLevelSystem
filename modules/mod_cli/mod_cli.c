@@ -191,28 +191,28 @@ static void cmd_help_builtin(int fd, const char *cmd)
             "    Query parameters become message headers.\n\n"
             "    Examples:\n"
             "      get /core/status\n"
-            "      get /ssip/resources/report\n"
-            "      get /ssip/functions/enable?job=check_sip\n"
-            "      get /ssip/functions/set_interval?interval=120\n"
-            "      cd /ssip/resources && get status    (relative path)\n\n");
+            "      get /metrics/resources/cpu\n"
+            "      get /cache/functions/get?key=session\n"
+            "      get /cron/functions/jobs\n"
+            "      cd /metrics/resources && get cpu    (relative path)\n\n");
     } else if (strcmp(cmd, "ls") == 0) {
         send_str(fd,
             "\n  ls [path]\n\n"
             "    List child paths at the given location (or current cd).\n"
             "    Shows path name and owning module.\n\n"
             "    Examples:\n"
-            "      ls                     (list root)\n"
-            "      ls /ssip               (list ssip children)\n"
-            "      ls /ssip/functions      (list all ssip functions)\n"
-            "      cd /ssip && ls          (same as ls /ssip)\n\n");
+            "      ls                      (list root)\n"
+            "      ls /cache               (list cache children)\n"
+            "      ls /cache/functions     (list all cache functions)\n"
+            "      cd /cache && ls         (same as ls /cache)\n\n");
     } else if (strcmp(cmd, "cd") == 0) {
         send_str(fd,
             "\n  cd <path>\n\n"
             "    Change the working directory. Affects ls and get (relative paths).\n"
             "    The prompt shows the current path.\n\n"
             "    Examples:\n"
-            "      cd /ssip/functions\n"
-            "      get check_sip           (resolves to /ssip/functions/check_sip)\n"
+            "      cd /cache/functions\n"
+            "      get get?key=foo         (resolves to /cache/functions/get)\n"
             "      cd /                    (back to root)\n\n");
     } else if (strcmp(cmd, "set") == 0) {
         send_str(fd,
@@ -228,7 +228,7 @@ static void cmd_help_builtin(int fd, const char *cmd)
             "    Supports full terminal: htop, vi, top, less, sudo.\n"
             "    Type 'exit' to return to Portal CLI.\n\n"
             "    Examples:\n"
-            "      shell ssip888           (remote shell on ssip888 via federation)\n"
+            "      shell mynode            (remote shell on peer 'mynode' via federation)\n"
             "      shell                   (local shell on this machine)\n\n");
     } else {
         char buf[128];

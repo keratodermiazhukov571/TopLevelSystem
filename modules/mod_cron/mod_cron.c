@@ -235,10 +235,10 @@ int portal_module_load(portal_core_t *core)
      * hitting portal_module_handle() to drive cron_tick(). On a host
      * that doesn't get any HTTP/CLI probes to /cron/... scheduled jobs
      * never fired, regardless of their interval. That broke every
-     * module that depends on mod_cron for periodic work — notably
-     * mod_ssip's check_sip probe on SSIP devices, which could not
-     * detect Asterisk failure without something externally polling
-     * /cron/resources/jobs in a loop.
+     * module that depends on mod_cron for periodic work — for example,
+     * a health-probe job scheduled every 60s could not detect service
+     * failure without something externally polling /cron/resources/jobs
+     * in a loop.
      *
      * Registering a 1 Hz timer on the core event loop makes cron_tick()
      * run once per second regardless of external traffic. The tick
