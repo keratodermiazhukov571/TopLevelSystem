@@ -1114,9 +1114,11 @@ static uint64_t now_us(void)
 static worker_t *get_worker(node_peer_t *peer)
 {
     pthread_mutex_lock(&peer->lock);
+
+    /* Find a usable worker: fd >= 0 and not busy. */
     for (int attempt = 0; attempt < peer->worker_count; attempt++) {
         int idx = (peer->next_worker + attempt) % peer->worker_count;
-        if (!peer->workers[idx].busy && peer->workers[idx].fd >= 0) {
+        if (peer->workers[idx].fd >= 0 && !peer->workers[idx].busy) {
             peer->workers[idx].busy = 1;
             peer->next_worker = (idx + 1) % peer->worker_count;
             pthread_mutex_unlock(&peer->lock);
@@ -1124,11 +1126,50 @@ static worker_t *get_worker(node_peer_t *peer)
             return &peer->workers[idx];
         }
     }
-    int idx = peer->next_worker;
-    peer->next_worker = (idx + 1) % peer->worker_count;
+
+    /* No usable worker. shell_connect_thread and pipe_relay_thread set
+     * w->fd=-1, w->busy=0 on teardown but cannot compact the slot from
+     * a background thread. Without recovery, each shell/pipe permanently
+     * consumes a slot and after worker_count sessions the peer looks
+     * "unavailable" even though the ctrl_fd and the remote peer are fine.
+     *
+     * If every slot is fd=-1 (all workers fully burnt — no live sessions
+     * and no clean slots), mark the peer dead. reconnect_dead_peers
+     * evicts inbound peers on the next tick (the remote end reconnects
+     * with fresh workers) or async-reconnects outbound ones.
+     *
+     * DO NOT mutate peer->workers[] here — any background
+     * shell_connect_thread / pipe_relay_thread currently running may hold
+     * a worker_t* pointer into that array. Compacting via in-place shift
+     * would overwrite its slot with a neighbour's (fd, ssl) fields,
+     * causing that thread to SSL_read on a stranger's SSL handle and
+     * crash (observed 2026-04-18 on core1 gdb session). */
+    int any_alive = 0;
+    for (int i = 0; i < peer->worker_count; i++) {
+        if (peer->workers[i].fd >= 0) { any_alive = 1; break; }
+    }
+    int just_marked_dead = 0;
+    if (!any_alive && !peer->dead) {
+        peer->dead = 1;
+        peer->ready = 0;
+        just_marked_dead = 1;
+        g_core->log(g_core, PORTAL_LOG_WARN, "node",
+                    "Peer '%s' — all workers burnt (shell/pipe), "
+                    "marking dead for reconnect", peer->name);
+    }
+
     pthread_mutex_unlock(&peer->lock);
-    g_core->fd_del(g_core, peer->workers[idx].fd);
-    return &peer->workers[idx];
+
+    /* Drive the reconnect immediately instead of waiting up to
+     * NODE_RECONNECT_SEC (10 s) for the timer. We're on the main thread
+     * (handle_shell / handle_pipe dispatch from portal_module_handle),
+     * and reconnect_dead_peers() is main-thread-safe; the `peer` struct
+     * may be freed inside it (inbound peers get peers_remove_at'd), so
+     * we MUST NOT dereference `peer` after this call. */
+    if (just_marked_dead)
+        reconnect_dead_peers();
+
+    return NULL;
 }
 
 static void release_worker(node_peer_t *peer, worker_t *w)
@@ -3558,20 +3599,210 @@ int portal_module_unload(portal_core_t *core)
 typedef struct {
     int            local_fd;     /* socketpair end — relay to caller */
     node_peer_t   *peer;         /* target peer (or hub for indirect) */
-    worker_t      *worker;       /* pre-acquired worker (fd already removed from ev loop) */
+    worker_t      *worker;       /* pool worker (mutually exclusive with own_fd);
+                                    fd already removed from ev loop */
+    int            own_fd;       /* private TCP fd (outbound-only, fresh
+                                    connection, never touched the pool).
+                                    -1 if using a pool worker. */
+    void          *own_ssl;      /* SSL* for own_fd, or NULL if plain TCP */
     int            rows;
     int            cols;
     char           target[PORTAL_MAX_MODULE_NAME]; /* actual target peer name */
     int            indirect;     /* 1 = routing through hub */
 } shell_connect_ctx_t;
 
+/* Open a dedicated TCP/TLS/PORTAL02 connection to `peer` for this shell.
+ * Blocking I/O from a background thread — never enters the event loop,
+ * never consumes a pool worker. Requires cfg_host/cfg_port, so this is
+ * only valid for outbound peers (peer->is_inbound == 0). On success,
+ * *out_fd is the handshake-complete fd and *out_ssl is the SSL* (NULL
+ * when TLS is disabled). On failure returns -1 with fd/ssl cleaned up. */
+static int shell_connect_private(node_peer_t *peer, int *out_fd, void **out_ssl)
+{
+    if (!peer || peer->cfg_host[0] == '\0' || peer->cfg_port <= 0)
+        return -1;
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+    struct timeval cto = {10, 0};
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &cto, sizeof(cto));
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &cto, sizeof(cto));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)peer->cfg_port);
+    if (inet_pton(AF_INET, peer->cfg_host, &addr.sin_addr) <= 0) {
+        close(fd);
+        return -1;
+    }
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        g_core->log(g_core, PORTAL_LOG_ERROR, "node",
+                    "Shell private: connect %s:%d failed: %s",
+                    peer->cfg_host, peer->cfg_port, strerror(errno));
+        close(fd);
+        return -1;
+    }
+
+    void *ssl = NULL;
+#ifdef HAS_SSL
+    if (g_ssl_client_ctx) {
+        SSL *s = SSL_new(g_ssl_client_ctx);
+        if (!s) { close(fd); return -1; }
+        SSL_set_fd(s, fd);
+        if (SSL_connect(s) != 1) {
+            g_core->log(g_core, PORTAL_LOG_ERROR, "node",
+                        "Shell private: TLS handshake to %s:%d failed",
+                        peer->cfg_host, peer->cfg_port);
+            SSL_free(s);
+            close(fd);
+            return -1;
+        }
+        ssl = s;
+    }
+#endif
+
+    /* PORTAL02 send — mirror drive_hs_send_build, advertise 0 peers */
+    uint8_t hs[512];
+    uint8_t *p = hs;
+    memcpy(p, NODE_HANDSHAKE_MAGIC, 8); p += 8;
+    if (g_has_key)
+        memcpy(p, g_key_hash, NODE_KEY_HASH_LEN);
+    else
+        memset(p, 0, NODE_KEY_HASH_LEN);
+    p += NODE_KEY_HASH_LEN;
+    uint16_t nlen = (uint16_t)strlen(g_node_name);
+    p[0] = (uint8_t)(nlen >> 8); p[1] = (uint8_t)(nlen & 0xff); p += 2;
+    memcpy(p, g_node_name, nlen); p += nlen;
+    p[0] = 0; p[1] = 0; p += 2;  /* peer_adv_count = 0 */
+    size_t hs_len = (size_t)(p - hs);
+
+    if (node_send(fd, ssl, hs, hs_len) < 0) {
+#ifdef HAS_SSL
+        if (ssl) { SSL_shutdown((SSL *)ssl); SSL_free((SSL *)ssl); }
+#endif
+        close(fd);
+        return -1;
+    }
+
+    /* PORTAL02 recv — fixed 42-byte header + name + adv list */
+    uint8_t fixed[42];
+    if (node_recv(fd, ssl, fixed, 42) < 0 ||
+        memcmp(fixed, NODE_HANDSHAKE_MAGIC, 8) != 0) {
+#ifdef HAS_SSL
+        if (ssl) { SSL_shutdown((SSL *)ssl); SSL_free((SSL *)ssl); }
+#endif
+        close(fd);
+        return -1;
+    }
+    if (g_has_key &&
+        memcmp(fixed + 8, g_key_hash, NODE_KEY_HASH_LEN) != 0) {
+        g_core->log(g_core, PORTAL_LOG_ERROR, "node",
+                    "Shell private: federation key mismatch from %s", peer->name);
+#ifdef HAS_SSL
+        if (ssl) { SSL_shutdown((SSL *)ssl); SSL_free((SSL *)ssl); }
+#endif
+        close(fd);
+        return -1;
+    }
+    uint16_t rname_len = ((uint16_t)fixed[40] << 8) | fixed[41];
+    if (rname_len >= PORTAL_MAX_MODULE_NAME) {
+#ifdef HAS_SSL
+        if (ssl) { SSL_shutdown((SSL *)ssl); SSL_free((SSL *)ssl); }
+#endif
+        close(fd);
+        return -1;
+    }
+    char rname[PORTAL_MAX_MODULE_NAME];
+    if (rname_len > 0 && node_recv(fd, ssl, rname, rname_len) < 0) {
+#ifdef HAS_SSL
+        if (ssl) { SSL_shutdown((SSL *)ssl); SSL_free((SSL *)ssl); }
+#endif
+        close(fd);
+        return -1;
+    }
+    rname[rname_len] = '\0';
+
+    /* Consume remote's peer advertisement — don't care, just drain bytes */
+    uint8_t adv_cnt_buf[2];
+    if (node_recv(fd, ssl, adv_cnt_buf, 2) < 0) {
+#ifdef HAS_SSL
+        if (ssl) { SSL_shutdown((SSL *)ssl); SSL_free((SSL *)ssl); }
+#endif
+        close(fd);
+        return -1;
+    }
+    uint16_t adv_cnt = ((uint16_t)adv_cnt_buf[0] << 8) | adv_cnt_buf[1];
+    for (int k = 0; k < (int)adv_cnt; k++) {
+        uint8_t l2[2];
+        if (node_recv(fd, ssl, l2, 2) < 0) goto fail;
+        uint16_t l = ((uint16_t)l2[0] << 8) | l2[1];
+        while (l > 0) {
+            uint8_t drop[256];
+            size_t chunk = l > sizeof(drop) ? sizeof(drop) : l;
+            if (node_recv(fd, ssl, drop, chunk) < 0) goto fail;
+            l -= (uint16_t)chunk;
+        }
+    }
+
+    if (strcmp(rname, peer->name) != 0) {
+        g_core->log(g_core, PORTAL_LOG_WARN, "node",
+                    "Shell private: remote reports '%s', expected '%s'",
+                    rname, peer->name);
+        goto fail;
+    }
+
+    /* Clear timeouts — we are in raw relay mode now; select() drives blocking */
+    struct timeval notv = {0, 0};
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &notv, sizeof(notv));
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &notv, sizeof(notv));
+
+    *out_fd = fd;
+    if (out_ssl) *out_ssl = ssl;
+    return 0;
+
+fail:
+#ifdef HAS_SSL
+    if (ssl) { SSL_shutdown((SSL *)ssl); SSL_free((SSL *)ssl); }
+#endif
+    close(fd);
+    return -1;
+}
+
 static void *shell_connect_thread(void *arg)
 {
     shell_connect_ctx_t *c = (shell_connect_ctx_t *)arg;
     int lfd = c->local_fd;
-    worker_t *w = c->worker;  /* already acquired on main thread */
+    worker_t *w = c->worker;  /* NULL when using a private TCP */
 
-    /* Send /tunnel/shell via blocking I/O on the worker fd.
+    /* If requested, open the private TCP/TLS/PORTAL02 connection here
+     * (off the main thread — connect() and TLS handshake would block). */
+    if (!w && c->own_fd == -2) {
+        int  priv_fd  = -1;
+        void *priv_ssl = NULL;
+        if (shell_connect_private(c->peer, &priv_fd, &priv_ssl) < 0) {
+            g_core->log(g_core, PORTAL_LOG_ERROR, "node",
+                        "Shell private: failed to open connection to '%s'",
+                        c->target);
+            close(lfd);
+            free(c);
+            return NULL;
+        }
+        c->own_fd  = priv_fd;
+        c->own_ssl = priv_ssl;
+    }
+
+    /* Select transport: pool worker or our private fd. */
+    int   wfd  = (w ? w->fd  : c->own_fd);
+    void *wssl = NULL;
+#ifdef HAS_SSL
+    wssl = w ? w->ssl : c->own_ssl;
+#endif
+
+    /* Send /tunnel/shell via blocking I/O on the chosen fd.
      * For indirect peers: send /<target>/tunnel/shell so the hub routes it. */
     portal_msg_t smsg = {0};
     char spath[256];
@@ -3592,17 +3823,63 @@ static void *shell_connect_thread(void *arg)
     smsg.header_count = 2;
 
     portal_resp_t sr = {0};
-    int rc = worker_send_recv(w, &smsg, &sr);
+    int rc;
+    if (w) {
+        rc = worker_send_recv(w, &smsg, &sr);
+    } else {
+        /* Private-fd path: encode + send + receive + decode manually.
+         * Mirrors worker_send_recv but uses our own fd/ssl directly so
+         * we never touch worker_t state. */
+        struct timeval tv30 = {30, 0};
+        setsockopt(wfd, SOL_SOCKET, SO_RCVTIMEO, &tv30, sizeof(tv30));
+        setsockopt(wfd, SOL_SOCKET, SO_SNDTIMEO, &tv30, sizeof(tv30));
+
+        uint8_t *wire = NULL; size_t wlen = 0;
+        if (portal_wire_encode_msg(&smsg, &wire, &wlen) < 0) {
+            rc = -1;
+        } else if (node_send(wfd, wssl, wire, wlen) < 0) {
+            free(wire); rc = -1;
+        } else {
+            free(wire);
+            uint8_t hdr[4];
+            if (node_recv(wfd, wssl, hdr, 4) < 0) {
+                rc = -1;
+            } else {
+                int32_t rlen = portal_wire_read_length(hdr);
+                if (rlen <= 0 || rlen > NODE_BUF_SIZE) {
+                    rc = -1;
+                } else {
+                    uint8_t *rb = malloc((size_t)rlen + 4);
+                    memcpy(rb, hdr, 4);
+                    if (!rb || node_recv(wfd, wssl, rb + 4, (size_t)rlen) < 0) {
+                        free(rb); rc = -1;
+                    } else if (portal_wire_decode_resp(rb, (size_t)rlen + 4, &sr) < 0) {
+                        free(rb); rc = -1;
+                    } else {
+                        free(rb); rc = 0;
+                    }
+                }
+            }
+        }
+    }
 
     if (rc < 0 || sr.status != PORTAL_OK) {
         g_core->log(g_core, PORTAL_LOG_ERROR, "node",
                     "Shell: /tunnel/shell failed on peer '%s' (rc=%d status=%d)",
-                    c->peer->name, rc, sr.status);
-        /* Cannot call release_worker from background thread (libev not thread-safe).
-         * Just close the worker fd — it's already removed from the event loop. */
-        close(w->fd);
-        w->fd = -1;
-        w->busy = 0;
+                    c->target, rc, sr.status);
+        if (w) {
+            /* Pool worker path: release the slot so get_worker's self-heal
+             * eventually reclaims. Cannot call release_worker from bg thread. */
+            close(w->fd);
+            w->fd = -1;
+            w->busy = 0;
+        } else {
+            /* Private path: close our private fd + SSL */
+#ifdef HAS_SSL
+            if (wssl) { SSL_shutdown((SSL *)wssl); SSL_free((SSL *)wssl); }
+#endif
+            close(wfd);
+        }
         free(sr.body);
         close(lfd);
         free(c);
@@ -3611,17 +3888,11 @@ static void *shell_connect_thread(void *arg)
     free(sr.body);
 
     g_core->log(g_core, PORTAL_LOG_INFO, "node",
-                "Shell connected to '%s' via worker fd %d", c->peer->name, w->fd);
+                "Shell connected to '%s' via %s fd %d",
+                c->target, w ? "pool worker" : "private", wfd);
 
-    /* Worker fd is now in raw shell mode — relay between lfd and worker fd.
-     * worker_send_recv already set it to blocking mode. */
-    w->busy = 2;  /* pipe mode — won't be returned to pool */
-
-    int wfd = w->fd;
-    void *wssl = NULL;
-#ifdef HAS_SSL
-    wssl = w->ssl;
-#endif
+    if (w)
+        w->busy = 2;  /* pipe mode — pool will not select this slot */
 
     /* Remove socket timeouts for relay */
     struct timeval notv = {0, 0};
@@ -3668,17 +3939,36 @@ static void *shell_connect_thread(void *arg)
 shell_done:
     close(lfd);
 
-    /* Clean up worker fd — close it, don't return to pool.
-     * Cannot call node_fd_add_with_rx from background thread (libev). */
+    /* Teardown: two paths.
+     *   Pool worker path — close the worker fd (can't return it to pool;
+     *     it's raw bytes now) and tombstone the slot; get_worker's
+     *     self-heal will mark the peer dead when all slots are gone.
+     *   Private path — close our private TCP/TLS; no peer state to touch,
+     *     no pool impact, no reconnect cascade. */
+    if (w) {
 #ifdef HAS_SSL
-    if (wssl)
-        node_ssl_close(wfd, (SSL *)wssl);
+        if (wssl)
+            node_ssl_close(wfd, (SSL *)wssl);
 #endif
-    close(wfd);
-    w->fd = -1;
-    w->busy = 0;
+        close(wfd);
+        w->fd = -1;
+        w->busy = 0;
+    } else {
+#ifdef HAS_SSL
+        if (wssl) {
+            SSL_shutdown((SSL *)wssl);
+            SSL_free((SSL *)wssl);
+        }
+#endif
+        close(wfd);
+    }
+
+    /* Use c->target (string copy) not c->peer->name — the peer struct may
+     * have been freed by a concurrent reconnect_dead_peers if this was
+     * the last pool worker. (Private path never touches the peer struct.) */
     g_core->log(g_core, PORTAL_LOG_INFO, "node",
-                "Shell relay closed (peer '%s')", c->peer->name);
+                "Shell relay closed (peer '%s', %s)",
+                c->target, w ? "pool" : "private");
 
     free(c);
     return NULL;
@@ -4480,6 +4770,8 @@ int portal_module_handle(portal_core_t *core, const portal_msg_t *msg,
         ctx->local_fd = sp[0];
         ctx->rows = atoi(rows_str);
         ctx->cols = atoi(cols_str);
+        ctx->own_fd = -1;
+        ctx->own_ssl = NULL;
         snprintf(ctx->target, sizeof(ctx->target), "%s", peer_name);
         ctx->indirect = peer->is_indirect;
 
@@ -4488,8 +4780,24 @@ int portal_module_handle(portal_core_t *core, const portal_msg_t *msg,
              * Use message-based relay via g_core->send() in a thread. */
             ctx->peer = NULL;
             ctx->worker = NULL;
+        } else if (!peer->is_inbound &&
+                   peer->cfg_host[0] && peer->cfg_port > 0) {
+            /* Direct OUTBOUND peer: open a dedicated TCP/TLS connection
+             * for this shell — doesn't touch the federation pool. The
+             * blocking connect happens on the bg thread to avoid stalling
+             * the event loop. Fall through to pool worker if this peer
+             * somehow lacks cfg_host:cfg_port. */
+            ctx->peer = peer;
+            ctx->worker = NULL;
+            /* own_fd / own_ssl filled by shell_connect_thread below
+             * (deferred so connect() doesn't block the event loop). */
+            ctx->own_fd = -2;   /* sentinel: "bg thread must open private conn" */
         } else {
-            /* Direct peers: raw fd relay through worker */
+            /* Direct INBOUND peer (remote initiated to us; we can't
+             * initiate back to their NAT): borrow a pool worker. Shell
+             * teardown burns the slot; get_worker's self-heal marks the
+             * peer dead once all slots are burnt, forcing a fresh
+             * reconnect from the remote. */
             ctx->peer = peer;
             worker_t *w = get_worker(peer);
             if (!w || w->fd < 0) {
