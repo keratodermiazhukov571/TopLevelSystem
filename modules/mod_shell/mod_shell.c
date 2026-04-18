@@ -702,6 +702,115 @@ static void tls_plain_relay(int plain_fd, int tls_fd, void *ssl_ptr)
     }
 }
 
+/* ─── Shared PTY session: prompt username, drop privileges, exec /bin/su ─
+ *
+ * Runs the user-facing half of a shell session: forkpty, in the child
+ * print a login prompt and read a username, drop to nobody, then exec
+ * /bin/su -l <user> so PAM enforces password auth; in the parent run
+ * tls_plain_relay between the PTY master and the TLS connection until
+ * either side closes.
+ *
+ * Used by BOTH ends of the dial-back/direct shell flow:
+ *   - dialback_thread calls this after opening its outbound TLS to the
+ *     initiator (target ran the dial).
+ *   - accept_handler_thread calls this in DIRECT mode after receiving
+ *     an incoming TCP from a NAT'd initiator (initiator ran the dial).
+ *
+ * Either way PTY + /bin/su run on THIS machine — the one the user
+ * wants to shell into. The only difference is which side opened the
+ * TCP, which is what the "who-is-reachable" try-direct-else-dialback
+ * logic on the initiator resolves. */
+static void run_pty_session(int tls_fd, void *ssl_any,
+                            int rows, int cols, const char *tag)
+{
+    struct winsize ws = {
+        .ws_row = (unsigned short)(rows > 0 ? rows : 24),
+        .ws_col = (unsigned short)(cols > 0 ? cols : 80)
+    };
+    int master_fd;
+    pid_t pid = forkpty(&master_fd, NULL, NULL, &ws);
+    if (pid < 0) {
+        g_core->log(g_core, PORTAL_LOG_ERROR, "shell",
+                    "%s: forkpty failed: %s", tag, strerror(errno));
+        return;
+    }
+    if (pid == 0) {
+        /* Child — PTY slave on stdin/stdout/stderr. Prompt for a
+         * username, drop privileges, exec /bin/su. See the /bin/su
+         * security note at the top of this file / module README. */
+        setenv("TERM", "xterm-256color", 1);
+
+        char banner[256], host[64] = "portal";
+        gethostname(host, sizeof(host));
+        host[sizeof(host) - 1] = '\0';
+        int bn = snprintf(banner, sizeof(banner), "\r\n%s login: ", host);
+        if (bn > 0) (void)!write(STDOUT_FILENO, banner, (size_t)bn);
+
+        char user[33];
+        int upos = 0;
+        while (upos < (int)sizeof(user) - 1) {
+            char ch;
+            ssize_t n = read(STDIN_FILENO, &ch, 1);
+            if (n <= 0) _exit(1);
+            if (ch == '\r' || ch == '\n') break;
+            if (ch == 0x7f || ch == 0x08) {
+                if (upos > 0) { upos--; (void)!write(STDOUT_FILENO, "\b \b", 3); }
+                continue;
+            }
+            if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                  (ch >= '0' && ch <= '9') ||
+                   ch == '.' || ch == '_' || ch == '-'))
+                continue;
+            user[upos++] = ch;
+        }
+        user[upos] = '\0';
+        (void)!write(STDOUT_FILENO, "\r\n", 2);
+        if (upos == 0) _exit(1);
+        for (char *p = user; *p; p++) {
+            if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+                  (*p >= '0' && *p <= '9') ||
+                   *p == '.' || *p == '_' || *p == '-'))
+                _exit(1);
+        }
+
+        /* Drop privileges to nobody so /bin/su goes through PAM auth.
+         * See the long security comment elsewhere in this file. */
+        struct passwd *pw_nobody = getpwnam("nobody");
+        uid_t nob_uid = pw_nobody ? pw_nobody->pw_uid : 65534;
+        gid_t nob_gid = pw_nobody ? pw_nobody->pw_gid : 65534;
+        if (setgroups(0, NULL) != 0 ||
+            setgid(nob_gid) != 0 ||
+            setuid(nob_uid) != 0) {
+            dprintf(STDOUT_FILENO,
+                "\r\nshell: failed to drop privileges (%s); aborting "
+                "login for safety.\r\n", strerror(errno));
+            _exit(1);
+        }
+        for (int cfd = 3; cfd < 1024; cfd++) close(cfd);
+
+        const char *su_bin = g_cfg.shell_login_binary[0]
+            ? g_cfg.shell_login_binary : "/bin/su";
+        execl(su_bin, "su", "-l", user, (char *)NULL);
+        dprintf(STDOUT_FILENO, "\r\nexec %s failed: %s\r\n",
+                su_bin, strerror(errno));
+        _exit(127);
+    }
+
+    g_core->log(g_core, PORTAL_LOG_INFO, "shell",
+                "%s: /bin/su pid=%d (%dx%d)", tag, pid, ws.ws_col, ws.ws_row);
+
+    tls_plain_relay(master_fd, tls_fd, ssl_any);
+
+    kill(pid, SIGHUP);
+    usleep(50000);
+    kill(pid, SIGKILL);
+    waitpid(pid, NULL, WNOHANG);
+    close(master_fd);
+
+    g_core->log(g_core, PORTAL_LOG_INFO, "shell",
+                "%s: PTY session closed", tag);
+}
+
 /* ─── Server-side: listener + accept handler ─────────────────────────── */
 
 static void *accept_handler_thread(void *arg)
@@ -730,8 +839,14 @@ static void *accept_handler_thread(void *arg)
     }
 #endif
 
-    /* Read session_id line (max 80 chars). */
-    char line[96];
+    /* Read first line — up to 128 chars, '\n'- or '\r'-terminated.
+     * Two possible formats:
+     *   <64-hex session_id>           → dial-back (initiator is us; we
+     *                                     bridge this TLS fd to the waiting
+     *                                     handle_open_remote caller)
+     *   DIRECT <rows> <cols>          → direct (initiator opened TCP to us;
+     *                                     PTY + /bin/su run HERE) */
+    char line[128];
     int pos = 0;
     while (pos < (int)sizeof(line) - 1) {
         char ch;
@@ -748,6 +863,28 @@ static void *accept_handler_thread(void *arg)
     line[pos] = '\0';
     if (pos == 0) goto bail;
 
+    /* DIRECT mode — initiator opened TCP to our shell_port because
+     * ITS side is behind NAT / not reachable. We run the PTY locally. */
+    if (strncmp(line, "DIRECT", 6) == 0 && (line[6] == '\0' || line[6] == ' ')) {
+        int rows = 24, cols = 80;
+        if (line[6] == ' ') {
+            if (sscanf(line + 7, "%d %d", &rows, &cols) != 2) {
+                rows = 24; cols = 80;
+            }
+        }
+        /* Clear timeouts — raw relay mode from here on. */
+        struct timeval notv = {0, 0};
+        setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &notv, sizeof(notv));
+        setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &notv, sizeof(notv));
+
+        g_core->log(g_core, PORTAL_LOG_INFO, "shell",
+                    "direct: incoming connection accepted (%dx%d), "
+                    "running /bin/su here", rows, cols);
+        run_pty_session(cfd, ssl_any, rows, cols, "direct");
+        goto bail;
+    }
+
+    /* Otherwise: must be a dial-back session_id. Match pending entry. */
     pending_shell_t *ps = pending_take(line);
     if (!ps) {
         g_core->log(g_core, PORTAL_LOG_WARN, "shell",
@@ -962,142 +1099,17 @@ static void *dialback_thread(void *arg)
         close(fd); free(c); return NULL;
     }
 
-    /* 4. forkpty + exec /bin/login. */
-    struct winsize ws = {
-        .ws_row = (unsigned short)(c->rows > 0 ? c->rows : 24),
-        .ws_col = (unsigned short)(c->cols > 0 ? c->cols : 80)
-    };
-    int master_fd;
-    pid_t pid = forkpty(&master_fd, NULL, NULL, &ws);
-    if (pid < 0) {
-        g_core->log(g_core, PORTAL_LOG_ERROR, "shell",
-                    "dial-back: forkpty failed: %s", strerror(errno));
-#ifdef HAS_SSL
-        if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); }
-#endif
-        close(fd); free(c); return NULL;
-    }
-    if (pid == 0) {
-        /* Child — we ARE the PTY slave process (stdin/stdout/stderr all
-         * point at /dev/pts/N courtesy of forkpty). Prompt for the
-         * username ourselves, validate it, then exec `/bin/su -l <user>`.
-         *
-         * This deliberately avoids /bin/login: modern util-linux 2.40
-         * on AlmaLinux 10 rejects forkpty'd PTYs with "FATAL: bad tty"
-         * because its check_tty() logic expects to be invoked by getty
-         * with additional setup we don't do. /bin/su is simpler, uses
-         * PAM for auth exactly like login does, drops to the user's
-         * UID, runs their login shell, and writes utmp/wtmp cleanly. */
-        setenv("TERM", "xterm-256color", 1);
+    /* 4. Run the PTY session (fork child → prompt + drop + /bin/su,
+     *    parent → tls_plain_relay). Shared with DIRECT-mode path. */
+    char tag[48];
+    snprintf(tag, sizeof(tag), "dial-back '%.8s...'", c->session_id);
+    run_pty_session(fd, ssl_any, c->rows, c->cols, tag);
 
-        /* Small host banner then username prompt. */
-        char banner[256];
-        char host[64] = "portal";
-        gethostname(host, sizeof(host));
-        host[sizeof(host) - 1] = '\0';
-        int bn = snprintf(banner, sizeof(banner), "\r\n%s login: ", host);
-        if (bn > 0) (void)!write(STDOUT_FILENO, banner, (size_t)bn);
-
-        /* Read a login name. Character-at-a-time so we can echo it
-         * (PTY default is canonical + echo, but some clients disable
-         * echo; this makes the prompt visible consistently). Cap the
-         * name to something sane. */
-        char user[33];
-        int upos = 0;
-        while (upos < (int)sizeof(user) - 1) {
-            char ch;
-            ssize_t n = read(STDIN_FILENO, &ch, 1);
-            if (n <= 0) _exit(1);
-            if (ch == '\r' || ch == '\n') break;
-            if (ch == 0x7f || ch == 0x08) {           /* backspace */
-                if (upos > 0) { upos--; (void)!write(STDOUT_FILENO, "\b \b", 3); }
-                continue;
-            }
-            /* Accept alnum + ._- only — typical POSIX username set. */
-            if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
-                  (ch >= '0' && ch <= '9') ||
-                   ch == '.' || ch == '_' || ch == '-'))
-                continue;
-            user[upos++] = ch;
-        }
-        user[upos] = '\0';
-        (void)!write(STDOUT_FILENO, "\r\n", 2);
-        if (upos == 0) _exit(1);
-
-        /* Strip any lingering shell metacharacters defensively — the
-         * above filter already rejected them, but belt-and-braces for
-         * a value we are about to pass to /bin/su. */
-        for (char *p = user; *p; p++) {
-            if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
-                  (*p >= '0' && *p <= '9') ||
-                   *p == '.' || *p == '_' || *p == '-')) {
-                _exit(1);
-            }
-        }
-
-        /* CRITICAL SECURITY STEP — drop privileges before exec'ing su.
-         *
-         * Portal runs as root. If we exec /bin/su while still root, su
-         * sees our euid=0 and SKIPS the PAM password prompt entirely:
-         * the user typing "monitor<Enter>" at our login prompt would
-         * land in monitor's shell with zero authentication. That is a
-         * full remote unauthenticated privilege escalation.
-         *
-         * Drop to an unprivileged account (nobody, UID 65534 as
-         * fallback). /bin/su is SUID root so it still has the power to
-         * become the target user AFTER it validates the password via
-         * PAM — the setuid-to-nobody only strips the "caller is root"
-         * exemption that lets su skip the auth step. */
-        struct passwd *pw_nobody = getpwnam("nobody");
-        uid_t nob_uid = pw_nobody ? pw_nobody->pw_uid : 65534;
-        gid_t nob_gid = pw_nobody ? pw_nobody->pw_gid : 65534;
-        if (setgroups(0, NULL) != 0 ||
-            setgid(nob_gid) != 0 ||
-            setuid(nob_uid) != 0) {
-            /* If we can't drop privileges — we must NOT continue,
-             * because exec'ing su as root would be the security bug
-             * above. Print an error and exit; the dial-back session
-             * closes cleanly on the other side. */
-            dprintf(STDOUT_FILENO,
-                "\r\nshell: failed to drop privileges (%s); aborting "
-                "login for safety.\r\n", strerror(errno));
-            _exit(1);
-        }
-        /* Also close any inherited listen/connection fds from the
-         * parent (they are still visible via /proc/<pid>/fd). The
-         * exec will close them via CLOEXEC if set — which Portal
-         * doesn't guarantee — so be explicit. Keep 0/1/2 (PTY slave). */
-        for (int cfd = 3; cfd < 1024; cfd++) close(cfd);
-
-        const char *su_bin = g_cfg.shell_login_binary[0]
-            ? g_cfg.shell_login_binary : "/bin/su";
-        execl(su_bin, "su", "-l", user, (char *)NULL);
-        /* Fallback never runs when we reach here as nobody — /bin/bash
-         * wouldn't be useful, so just log the exec failure and exit. */
-        dprintf(STDOUT_FILENO, "\r\nexec %s failed: %s\r\n",
-                su_bin, strerror(errno));
-        _exit(127);
-    }
-
-    g_core->log(g_core, PORTAL_LOG_INFO, "shell",
-                "dial-back: session '%.8s...' /bin/login pid=%d",
-                c->session_id, pid);
-
-    /* 5. Relay PTY master ↔ TLS fd until either end closes. */
-    tls_plain_relay(master_fd, fd, ssl_any);
-
-    /* 6. Clean up child + TLS + socket. */
-    kill(pid, SIGHUP);
-    usleep(50000);
-    kill(pid, SIGKILL);
-    waitpid(pid, NULL, WNOHANG);
-    close(master_fd);
+    /* 5. Clean up TLS + socket. */
 #ifdef HAS_SSL
     if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); }
 #endif
     close(fd);
-    g_core->log(g_core, PORTAL_LOG_INFO, "shell",
-                "dial-back: session '%.8s...' closed", c->session_id);
     free(c);
     return NULL;
 }
@@ -1153,21 +1165,214 @@ static int handle_dialback_request(portal_core_t *core,
     return 0;
 }
 
+/* ─── Initiator-direct path ───────────────────────────────────────────
+ *
+ * Mirror of the dial-back: WE open the TCP (outbound to the target's
+ * shell_port) and the TARGET accepts + runs the PTY + /bin/su locally.
+ * Used when the initiator is NOT reachable (behind NAT / no inbound
+ * firewall rule) but the target IS. One line of extra logic in
+ * handle_open_remote selects which path to try first.
+ *
+ * Protocol on the wire (after TLS handshake):
+ *   initiator → target:   "DIRECT <rows> <cols>\n"
+ *   target then forks PTY, prompts login, drops to nobody, execs /bin/su.
+ *   Bytes flow both ways over the TLS fd.
+ *
+ * Reachability detection: we ask mod_node (/node/resources/peer/<name>)
+ * for the peer's Route and Host. If Route is "outbound", we know we
+ * can reach it (because our own federation connection to it works). We
+ * try a TCP connect to that host on our local g_cfg.shell_port with a
+ * short timeout. If connect succeeds we proceed; if not we fall back
+ * to dial-back.
+ * ───────────────────────────────────────────────────────────────────── */
+
+/* Query mod_node for a peer's Route + Host. If Route is outbound and
+ * the Host can be parsed, copy the host portion (without port) into
+ * out_host and return 0. Otherwise return -1. */
+static int resolve_peer_for_direct(const char *peer, char *out_host, size_t out_len)
+{
+    if (!g_core->module_loaded(g_core, "node")) return -1;
+
+    portal_msg_t *m = portal_msg_alloc();
+    portal_resp_t *r = portal_resp_alloc();
+    if (!m || !r) { if (m) portal_msg_free(m); if (r) portal_resp_free(r); return -1; }
+
+    char path[256];
+    snprintf(path, sizeof(path), "/node/resources/peer/%s", peer);
+    portal_msg_set_path(m, path);
+    portal_msg_set_method(m, PORTAL_METHOD_GET);
+    if (!m->ctx) m->ctx = calloc(1, sizeof(portal_ctx_t));
+    if (m->ctx) {
+        m->ctx->auth.user = strdup("root");
+        m->ctx->auth.token = strdup("__internal__");
+        portal_labels_add(&m->ctx->auth.labels, "root");
+    }
+    g_core->send(g_core, m, r);
+
+    int ok = -1;
+    if (r->status == PORTAL_OK && r->body && r->body_len > 0) {
+        char *body = malloc(r->body_len + 1);
+        if (body) {
+            memcpy(body, r->body, r->body_len);
+            body[r->body_len] = '\0';
+            int is_outbound = (strstr(body, "Route: outbound") != NULL);
+            const char *h = strstr(body, "Host: ");
+            if (is_outbound && h) {
+                h += 6;
+                const char *end = h;
+                while (*end && *end != ':' && *end != '\n' && *end != '\r') end++;
+                size_t hlen = (size_t)(end - h);
+                if (hlen > 0 && hlen < out_len) {
+                    memcpy(out_host, h, hlen);
+                    out_host[hlen] = '\0';
+                    ok = 0;
+                }
+            }
+            free(body);
+        }
+    }
+    portal_msg_free(m);
+    portal_resp_free(r);
+    return ok;
+}
+
+typedef struct {
+    int   tls_fd;
+    void *ssl;
+    int   plain_fd;     /* sp[0] — we own it; caller got sp[1] */
+    char  peer_tag[64];
+} direct_relay_ctx_t;
+
+static void *direct_relay_thread(void *arg)
+{
+    direct_relay_ctx_t *c = (direct_relay_ctx_t *)arg;
+    tls_plain_relay(c->plain_fd, c->tls_fd, c->ssl);
+    close(c->plain_fd);
+#ifdef HAS_SSL
+    if (c->ssl) { SSL_shutdown((SSL *)c->ssl); SSL_free((SSL *)c->ssl); }
+#endif
+    close(c->tls_fd);
+    g_core->log(g_core, PORTAL_LOG_INFO, "shell",
+                "direct: session to '%s' closed", c->peer_tag);
+    free(c);
+    return NULL;
+}
+
+/* Try to open a direct shell channel to peer at host:g_cfg.shell_port.
+ * Blocks up to ~3 s total (TCP connect + TLS handshake + one short
+ * write). On success, returns 0 and sets *out_fd to the plaintext side
+ * of the bridging socketpair; caller just read/writes it. On any
+ * failure returns -1 with everything cleaned up. */
+static int shell_try_direct(const char *peer_name, const char *host,
+                            int rows, int cols, int *out_fd)
+{
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+
+    struct timeval cto = {3, 0};
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &cto, sizeof(cto));
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &cto, sizeof(cto));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)g_cfg.shell_port);
+    if (inet_pton(AF_INET, host, &addr.sin_addr) <= 0) {
+        struct addrinfo hints = { .ai_family = AF_INET };
+        struct addrinfo *res = NULL;
+        if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res) {
+            close(fd); return -1;
+        }
+        addr.sin_addr = ((struct sockaddr_in *)res->ai_addr)->sin_addr;
+        freeaddrinfo(res);
+    }
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        close(fd); return -1;
+    }
+
+    void *ssl_any = NULL;
+#ifdef HAS_SSL
+    SSL *ssl = NULL;
+    if (g_client_ssl_ctx) {
+        ssl = SSL_new(g_client_ssl_ctx);
+        if (!ssl) { close(fd); return -1; }
+        SSL_set_fd(ssl, fd);
+        if (SSL_connect(ssl) != 1) {
+            SSL_free(ssl); close(fd); return -1;
+        }
+        ssl_any = ssl;
+    }
+#endif
+
+    /* Send DIRECT + rows + cols. */
+    char hdr[64];
+    int hn = snprintf(hdr, sizeof(hdr), "DIRECT %d %d\n", rows, cols);
+    int wrote;
+#ifdef HAS_SSL
+    if (ssl) wrote = (SSL_write(ssl, hdr, hn) == hn) ? hn : -1;
+    else
+#endif
+    wrote = (int)send(fd, hdr, (size_t)hn, MSG_NOSIGNAL);
+    if (wrote != hn) {
+#ifdef HAS_SSL
+        if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); }
+#endif
+        close(fd); return -1;
+    }
+
+    /* Clear timeouts — raw relay mode. */
+    struct timeval notv = {0, 0};
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &notv, sizeof(notv));
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &notv, sizeof(notv));
+
+    /* Build bridge: plain (handed to caller) ↔ TLS (relay thread owns). */
+    int sp[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) < 0) {
+#ifdef HAS_SSL
+        if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); }
+#endif
+        close(fd); return -1;
+    }
+
+    direct_relay_ctx_t *ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        close(sp[0]); close(sp[1]);
+#ifdef HAS_SSL
+        if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); }
+#endif
+        close(fd); return -1;
+    }
+    ctx->tls_fd = fd;
+    ctx->ssl = ssl_any;
+    ctx->plain_fd = sp[0];
+    snprintf(ctx->peer_tag, sizeof(ctx->peer_tag), "%s", peer_name);
+
+    pthread_t t;
+    if (pthread_create(&t, NULL, direct_relay_thread, ctx) != 0) {
+        free(ctx);
+        close(sp[0]); close(sp[1]);
+#ifdef HAS_SSL
+        if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); }
+#endif
+        close(fd); return -1;
+    }
+    pthread_detach(t);
+
+    *out_fd = sp[1];
+    return 0;
+}
+
 /* Handler called on the INITIATOR side by the CLI (or any caller) to open
- * a shell on a remote peer via the dial-back channel. Header: peer. Optional
- * headers: rows, cols, timeout. Returns the fd number (as ASCII body) that
- * the caller relays plaintext bytes to/from. */
+ * a shell on a remote peer. Tries the direct path first if the peer is
+ * reachable (outbound federation peer, meaning we already talk TCP to it);
+ * falls back to the dial-back path when the initiator is the reachable
+ * side. Header: peer. Optional headers: rows, cols, timeout. Returns
+ * the fd number (as ASCII body) that the caller relays plaintext bytes
+ * to/from. */
 static int handle_open_remote(portal_core_t *core,
                               const portal_msg_t *msg,
                               portal_resp_t *resp)
 {
-    if (g_listen_fd < 0) {
-        portal_resp_set_status(resp, PORTAL_UNAVAILABLE);
-        portal_resp_set_body(resp,
-            "shell dial-back listener not enabled (set shell_port in mod_shell.conf)\n", 72);
-        return -1;
-    }
-
     const char *peer = NULL;
     const char *rows_s = "24", *cols_s = "80";
     int wait_secs = g_cfg.shell_dial_timeout;
@@ -1184,6 +1389,43 @@ static int handle_open_remote(portal_core_t *core,
     }
     if (wait_secs < 1) wait_secs = 1;
     if (wait_secs > 60) wait_secs = 60;
+
+    /* ── Strategy A: try initiator-direct first. Works when the TARGET
+     *    is reachable on its shell_port (typical when the target is a
+     *    public host and we're behind NAT, e.g. ssip867 → ssip-hub).
+     *    Short timeout (~3 s) so a failed attempt falls back quickly. */
+    {
+        char direct_host[128];
+        if (resolve_peer_for_direct(peer, direct_host, sizeof(direct_host)) == 0) {
+            int fd = -1;
+            if (shell_try_direct(peer, direct_host,
+                                 atoi(rows_s), atoi(cols_s), &fd) == 0) {
+                char body[16];
+                int bn = snprintf(body, sizeof(body), "%d", fd);
+                portal_resp_set_status(resp, PORTAL_OK);
+                portal_resp_set_body(resp, body, (size_t)bn);
+                core->log(core, PORTAL_LOG_INFO, "shell",
+                          "direct: opened shell to '%s' at %s:%d fd=%d",
+                          peer, direct_host, g_cfg.shell_port, fd);
+                return 0;
+            }
+            core->log(core, PORTAL_LOG_INFO, "shell",
+                      "direct: connect to '%s' at %s:%d failed — "
+                      "falling back to dial-back",
+                      peer, direct_host, g_cfg.shell_port);
+        }
+    }
+
+    /* ── Strategy B: dial-back. Target opens TCP outbound to us, so this
+     *    is the path when WE are reachable and the target is NAT'd. */
+    if (g_listen_fd < 0) {
+        portal_resp_set_status(resp, PORTAL_UNAVAILABLE);
+        portal_resp_set_body(resp,
+            "shell unreachable: direct connect to peer failed and local "
+            "dial-back listener is disabled (set shell_port in "
+            "mod_shell.conf)\n", 145);
+        return -1;
+    }
 
     /* Determine the hostname/IP to tell the device to dial back to. */
     char host[128];
