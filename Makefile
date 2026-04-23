@@ -348,7 +348,11 @@ $(MOD_KV): $(MOD_DIR)/mod_kv/mod_kv.c $(CORE_DIR)/core_message.c
 
 $(MOD_WEBHOOK): $(MOD_DIR)/mod_webhook/mod_webhook.c $(CORE_DIR)/core_message.c
 	@echo "  SO    $@"
+ifeq ($(HAS_SSL),yes)
+	@$(CC) $(CFLAGS) -DHAS_SSL -shared -fPIC -o $@ $^ $(SSL_LIBS)
+else
 	@$(CC) $(CFLAGS) -shared -fPIC -o $@ $^
+endif
 
 $(MOD_SYSINFO): $(MOD_DIR)/mod_sysinfo/mod_sysinfo.c $(CORE_DIR)/core_message.c
 	@echo "  SO    $@"
@@ -466,7 +470,7 @@ $(TEST_PATH): $(TESTS_DIR)/test_path.c $(CORE_DIR)/core_path.c $(CORE_DIR)/core_
 	@echo "  CC    $@"
 	@$(CC) $(CFLAGS) -o $@ $^
 
-$(TEST_ACL): $(TESTS_DIR)/test_acl.c $(CORE_DIR)/core_path.c $(CORE_DIR)/core_message.c $(CORE_DIR)/core_hashtable.c
+$(TEST_ACL): $(TESTS_DIR)/test_acl.c $(CORE_DIR)/core_path.c $(CORE_DIR)/core_message.c $(CORE_DIR)/core_hashtable.c $(CORE_DIR)/core_auth.c $(CORE_DIR)/core_log.c $(CORE_DIR)/core_store.c $(LIB_DIR)/sha256/sha256.c
 	@mkdir -p $(BUILD_DIR)
 	@echo "  CC    $@"
 	@$(CC) $(CFLAGS) -o $@ $^

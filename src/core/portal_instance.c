@@ -351,6 +351,121 @@ static int api_event_emit(portal_core_t *core, const char *event_path,
     return portal_events_emit(&inst->events_reg, event_path, data, data_len);
 }
 
+/* Federation identity reconciler — wraps portal_auth_find_by_key with a
+ * module-friendly signature that copies username + labels out by value
+ * instead of returning a raw struct pointer. Used by mod_node's identity
+ * exchange. Returns 1 on match, 0 otherwise. Output pointers may be NULL. */
+static int api_auth_find_by_key(portal_core_t *core, const char *api_key,
+                                 char *out_username, size_t out_username_sz,
+                                 portal_labels_t *out_labels)
+{
+    portal_instance_t *inst = core->_internal;
+    auth_user_t *u = portal_auth_find_by_key(&inst->auth, api_key);
+    if (!u) return 0;
+    if (out_username && out_username_sz > 0)
+        snprintf(out_username, out_username_sz, "%s", u->username);
+    if (out_labels)
+        memcpy(out_labels, &u->labels, sizeof(portal_labels_t));
+    return 1;
+}
+
+/* Pure lookup of a Portal user by username. Used by mod_node to resolve
+ * federation_default_local_user at inbound dispatch time. */
+static int api_auth_find_user(portal_core_t *core, const char *username,
+                               portal_labels_t *out_labels)
+{
+    portal_instance_t *inst = core->_internal;
+    if (!username || !username[0]) return 0;
+    auth_user_t *u = portal_auth_find_user(&inst->auth, username);
+    if (!u) return 0;
+    if (out_labels)
+        memcpy(out_labels, &u->labels, sizeof(portal_labels_t));
+    return 1;
+}
+
+/* Get-or-create a Portal user. On creation, set api_key to the supplied
+ * `key` verbatim or generate one if key is NULL. On existing user, set
+ * api_key to `key` if non-NULL (overwrites), leave it alone if NULL.
+ * Persist via the same dual-write path the /users/<name> SET handler
+ * uses (config store + storage providers). Returns 1 if created, 0 if
+ * the user already existed, -1 on error. Used by modules that need to
+ * auto-provision users (mod_ssip_hub for carrier-bot users, mod_ssip
+ * for the privileged `hub` user on each device). */
+static int api_auth_ensure_user(portal_core_t *core,
+                                 const char *username,
+                                 const portal_labels_t *labels,
+                                 const char *key,
+                                 char *out_key, size_t out_key_sz)
+{
+    portal_instance_t *inst = core->_internal;
+    if (!username || !username[0]) return -1;
+
+    auth_user_t *u = portal_auth_find_user(&inst->auth, username);
+    int created = 0;
+    int key_changed = 0;
+    if (!u) {
+        portal_labels_t empty = {0};
+        const portal_labels_t *use_labels = labels ? labels : &empty;
+        if (portal_auth_add_user(&inst->auth, username, "", use_labels) != 0)
+            return -1;
+        u = portal_auth_find_user(&inst->auth, username);
+        if (!u) return -1;
+        if (key && key[0])
+            snprintf(u->api_key, sizeof(u->api_key), "%s", key);
+        else
+            portal_auth_generate_key(u->api_key, AUTH_KEY_LEN);
+        created = 1;
+    } else if (key && key[0] && strcmp(u->api_key, key) != 0) {
+        snprintf(u->api_key, sizeof(u->api_key), "%s", key);
+        key_changed = 1;
+    }
+
+    if (created || key_changed) {
+        /* Dual persistence — same path /users/<name> SET takes. */
+        portal_auth_save_user_to_store(&inst->auth, username, &inst->store);
+        char gbuf[PORTAL_MAX_LABELS * (PORTAL_MAX_LABEL_LEN + 2)] = {0};
+        size_t goff = 0;
+        for (int j = 0; j < u->labels.count && goff < sizeof(gbuf) - 1; j++) {
+            int gn = snprintf(gbuf + goff, sizeof(gbuf) - goff,
+                              "%s%s", j > 0 ? "," : "", u->labels.labels[j]);
+            if (gn < 0 || (size_t)gn >= sizeof(gbuf) - goff) break;
+            goff += (size_t)gn;
+        }
+        portal_storage_save_user(&inst->storage, u->username,
+                                  u->password, u->api_key, gbuf);
+    }
+
+    if (out_key && out_key_sz > 0)
+        snprintf(out_key, out_key_sz, "%s", u->api_key);
+    return created;
+}
+
+/* Law 15 — group-scoped output filter.
+ * Pure predicate lives in core_path.c (portal_labels_allow). This wrapper
+ * exists so modules can call it through the core->labels_allow fn pointer
+ * and so the audit event on sys.see_all bypass is emitted here, not in
+ * the pure predicate. */
+static int api_labels_allow(portal_core_t *core,
+                             const portal_ctx_t *ctx,
+                             const portal_labels_t *row_labels)
+{
+    portal_instance_t *inst = core->_internal;
+    int bypass = 0;
+    int allowed = portal_labels_allow(ctx, row_labels, &bypass);
+
+    if (allowed && bypass) {
+        /* Format: "user=<name>" — short, grep-friendly, no secrets. */
+        char body[PORTAL_MAX_LABEL_LEN + 16];
+        const char *user = (ctx && ctx->auth.user) ? ctx->auth.user : "?";
+        int n = snprintf(body, sizeof(body), "user=%s", user);
+        if (n < 0) n = 0;
+        portal_events_emit(&inst->events_reg, "/events/acl/bypass",
+                            body, (size_t)n + 1);
+    }
+
+    return allowed;
+}
+
 static int api_storage_register(portal_core_t *core,
                                 portal_storage_provider_t *provider)
 {
@@ -374,10 +489,13 @@ static int api_storage_register(portal_core_t *core,
     /* Sync existing users to the new provider */
     for (int i = 0; i < inst->auth.user_count; i++) {
         auth_user_t *u = &inst->auth.users[i];
-        char groups[1024] = {0};
-        for (int j = 0; j < u->labels.count; j++) {
-            if (j > 0) strcat(groups, ",");
-            strcat(groups, u->labels.labels[j]);
+        char groups[PORTAL_MAX_LABELS * (PORTAL_MAX_LABEL_LEN + 2)] = {0};
+        size_t off = 0;
+        for (int j = 0; j < u->labels.count && off < sizeof(groups) - 1; j++) {
+            int n = snprintf(groups + off, sizeof(groups) - off,
+                             "%s%s", j > 0 ? "," : "", u->labels.labels[j]);
+            if (n < 0 || (size_t)n >= sizeof(groups) - off) break;
+            off += (size_t)n;
         }
         provider->user_save(provider->ctx, u->username, u->password,
                              u->api_key, groups);
@@ -767,6 +885,10 @@ void portal_instance_setup_api(portal_instance_t *inst)
     inst->api.resource_keepalive = api_resource_keepalive;
     inst->api.resource_locked   = api_resource_locked;
     inst->api.resource_owner    = api_resource_owner;
+    inst->api.labels_allow      = api_labels_allow;
+    inst->api.auth_find_by_key  = api_auth_find_by_key;
+    inst->api.auth_ensure_user  = api_auth_ensure_user;
+    inst->api.auth_find_user    = api_auth_find_user;
     inst->api._internal         = inst;
 }
 
@@ -805,6 +927,16 @@ int portal_instance_init(portal_instance_t *inst)
 
     portal_auth_init(&inst->auth);
     portal_instance_setup_api(inst);
+
+    /* Law 15 — audit event emitted when labels_allow grants access via the
+     * sys.see_all super-admin bypass. Declared in core so it exists before
+     * any module has a chance to bypass. Body: "user=<name>". */
+    portal_events_register(&inst->events_reg, "/events/acl/bypass", "core",
+                            "Emitted when labels_allow() grants access via "
+                            "the sys.see_all bypass. Body: user=<name>.",
+                            NULL);
+    portal_path_register(&inst->paths, "/events/acl/bypass", "core");
+
     return 0;
 }
 

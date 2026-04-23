@@ -28,6 +28,7 @@
 #include <dirent.h>
 #include <getopt.h>
 #include <sys/stat.h>
+#include <sys/random.h>
 #ifndef _WIN32
 #include <signal.h>
 #include <termios.h>
@@ -389,32 +390,37 @@ static int run_remote_cli(const char *socket_path, const char *instance_name)
 
 /* --- Instance creator --- */
 
+/* CSPRNG-backed random string; fail closed on kernel CSPRNG
+ * unavailability (leaves buf empty). See docs/CODING.md rule #3. */
 static void generate_random_str(char *buf, size_t len)
 {
     static const char chars[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    FILE *f = fopen("/dev/urandom", "rb");
-    for (size_t i = 0; i < len; i++) {
-        unsigned char c = 0;
-        if (f) { if (fread(&c, 1, 1, f) != 1) c = (unsigned char)rand(); }
-        else c = (unsigned char)rand();
-        buf[i] = chars[c % (sizeof(chars) - 1)];
+    unsigned char raw[128];
+    if (len > sizeof(raw)) len = sizeof(raw);
+    if (getrandom(raw, len, 0) != (ssize_t)len) {
+        if (len > 0) buf[0] = '\0';
+        return;
     }
+    for (size_t i = 0; i < len; i++)
+        buf[i] = chars[raw[i] % (sizeof(chars) - 1)];
     buf[len] = '\0';
-    if (f) fclose(f);
 }
 
 static void generate_hex_str(char *buf, size_t len)
 {
     static const char hex[] = "0123456789abcdef";
-    FILE *f = fopen("/dev/urandom", "rb");
+    unsigned char raw[64];
+    size_t need = (len + 1) / 2;
+    if (need > sizeof(raw)) need = sizeof(raw);
+    if (getrandom(raw, need, 0) != (ssize_t)need) {
+        if (len > 0) buf[0] = '\0';
+        return;
+    }
     for (size_t i = 0; i < len; i++) {
-        unsigned char c = 0;
-        if (f) { if (fread(&c, 1, 1, f) != 1) c = (unsigned char)rand(); }
-        else c = (unsigned char)rand();
-        buf[i] = hex[c % 16];
+        unsigned char b = raw[i / 2];
+        buf[i] = hex[(i & 1) ? (b & 0xf) : (b >> 4)];
     }
     buf[len] = '\0';
-    if (f) fclose(f);
 }
 
 /* Scan existing instances for used ports */
@@ -591,6 +597,29 @@ static int create_instance(const char *name)
         "# key_file         : PEM private key file for TLS\n"
         "# tls_verify       : Require valid peer certificates (false = self-signed OK)\n"
         "# federation_key   : Shared secret for node authentication (both sides must match)\n"
+        "# peer_labels      : Law 15 — comma-separated list of <peer_name>:<label1>+<label2>+...\n"
+        "#                    Peers listed here are visible only to callers whose labels intersect.\n"
+        "#                    Unlisted peers are public (visible to everyone). Example:\n"
+        "#                      peer_labels = ssip-000123:5,ssip-000456:19+region-north\n"
+        "#\n"
+        "# Federation identity (always-on as of Phase 5, 2026-04-19): peers\n"
+        "# exchange API keys immediately after the PORTAL02 handshake via\n"
+        "# /node/functions/identity_proof. Each side resolves the other\n"
+        "# side's key against its local user registry. Subsequent inbound\n"
+        "# messages from the peer are dispatched as the resolved local user,\n"
+        "# or anonymous if no key matched. There is no compat fallback — a\n"
+        "# peer with no key in our peer_keys map (and no peer_default_key\n"
+        "# set) arrives anonymous and gets denied at every labeled path or\n"
+        "# row.\n"
+        "#\n"
+        "# peer_default_key : Our outbound key for any peer not listed in peer_keys.\n"
+        "#                    Empty (default) means no default — peers without a key are\n"
+        "#                    anonymous to us. For multi-tenant deployments, leave empty.\n"
+        "# peer_keys        : Comma-separated list of <peer_name>:<hex-key> entries.\n"
+        "#                    Each <hex-key> must match the api_key of a Portal user on\n"
+        "#                    the peer (which is the identity we want them to see us as).\n"
+        "#                    Example:\n"
+        "#                      peer_keys = ssip-hub:3f2a91c4..., ssip867:7a1b8c3d...\n"
         "enabled = true\n\n"
         "[mod_node]\n"
         "node_name        = %s\n"
@@ -600,7 +629,10 @@ static int create_instance(const char *name)
         "cert_file        = /etc/portal/%s/certs/server.crt\n"
         "key_file         = /etc/portal/%s/certs/server.key\n"
         "tls_verify       = false\n"
-        "# federation_key   = change-me-to-a-secret\n",
+        "# federation_key   = change-me-to-a-secret\n"
+        "# peer_labels      =\n"
+        "# peer_default_key =\n"
+        "# peer_keys        =\n",
         name, node_port, name, name);
     MOD_CLOSE();
 
@@ -900,10 +932,20 @@ static int create_instance(const char *name)
     #undef MOD_CONF
     #undef MOD_CLOSE
 
-    /* Write users/root.conf */
+    /* Guard against entropy failure — never persist an empty root
+     * password. If getrandom failed in generate_random_str/_hex_str,
+     * refuse to write a broken root.conf. */
+    if (!root_pass[0] || !root_key[0]) {
+        fprintf(stderr, "portal -C: CSPRNG unavailable — refusing to "
+                        "create instance with unseeded root credentials\n");
+        return 1;
+    }
+    /* Write users/root.conf with mode 0600 so the password is not
+     * world-readable. */
     snprintf(path, sizeof(path), "%s/users/root.conf", base);
     f = fopen(path, "w");
     if (f) {
+        fchmod(fileno(f), 0600);
         fprintf(f, "password = %s\napi_key = %s\ngroups = root,admin\n",
                 root_pass, root_key);
         fclose(f);

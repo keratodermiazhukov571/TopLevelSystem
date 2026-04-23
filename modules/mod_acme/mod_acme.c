@@ -47,6 +47,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 #include <pthread.h>
@@ -95,72 +96,129 @@ static const char *get_hdr(const portal_msg_t *msg, const char *key)
     return NULL;
 }
 
-/* Execute ACME tool to request certificate */
+/* Run a command with argv array — no shell, no injection.
+ * Captures up to `outcap` bytes of combined stdout+stderr for error
+ * reporting. Returns the exit code, or -1 on fork/pipe failure.
+ * See docs/CODING.md rule #1. */
+static int run_cmd(const char *prog, char *const argv[],
+                   char *out, size_t outcap)
+{
+    int pfd[2];
+    if (pipe(pfd) < 0) return -1;
+    pid_t pid = fork();
+    if (pid < 0) { close(pfd[0]); close(pfd[1]); return -1; }
+    if (pid == 0) {
+        close(pfd[0]);
+        dup2(pfd[1], STDOUT_FILENO);
+        dup2(pfd[1], STDERR_FILENO);
+        close(pfd[1]);
+        execvp(prog, argv);
+        _exit(127);
+    }
+    close(pfd[1]);
+    size_t off = 0;
+    if (out && outcap > 1) {
+        while (off < outcap - 1) {
+            ssize_t n = read(pfd[0], out + off, outcap - 1 - off);
+            if (n <= 0) break;
+            off += (size_t)n;
+        }
+        out[off] = '\0';
+    } else {
+        char drop[4096];
+        while (read(pfd[0], drop, sizeof(drop)) > 0) { }
+    }
+    close(pfd[0]);
+    int status = 0;
+    waitpid(pid, &status, 0);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+/* Execute ACME tool to request certificate — no shell, argv only. */
 static int request_certificate(const char *domain, const char *email,
                                 const char *cert_dir)
 {
-    char cmd[2048];
+    /* Pre-format the path/domain combinations once; argv entries must
+     * be stable string storage. */
+    char crt_path[1024], key_path[1024], fc_path[1024], subj[300];
+    snprintf(crt_path, sizeof(crt_path), "%s/%s.crt", cert_dir, domain);
+    snprintf(key_path, sizeof(key_path), "%s/%s.key", cert_dir, domain);
+    snprintf(fc_path,  sizeof(fc_path),  "%s/%s.fullchain.crt",
+             cert_dir, domain);
+    snprintf(subj, sizeof(subj), "/CN=%s", domain);
 
-    /* Check if acme.sh is available */
+    int rc;
+    char output[4096] = "";
+
     if (access("/root/.acme.sh/acme.sh", X_OK) == 0) {
-        snprintf(cmd, sizeof(cmd),
-            "/root/.acme.sh/acme.sh --issue -d %s --standalone "
-            "--cert-file %s/%s.crt --key-file %s/%s.key "
-            "--fullchain-file %s/%s.fullchain.crt "
-            "%s%s "
-            "2>&1",
-            domain,
-            cert_dir, domain, cert_dir, domain,
-            cert_dir, domain,
-            email[0] ? "--accountemail " : "",
-            email[0] ? email : "");
+        if (email[0]) {
+            char *const argv[] = {
+                "acme.sh", "--issue", "-d", (char *)domain, "--standalone",
+                "--cert-file", crt_path, "--key-file", key_path,
+                "--fullchain-file", fc_path,
+                "--accountemail", (char *)email, NULL
+            };
+            rc = run_cmd("/root/.acme.sh/acme.sh", argv,
+                         output, sizeof(output));
+        } else {
+            char *const argv[] = {
+                "acme.sh", "--issue", "-d", (char *)domain, "--standalone",
+                "--cert-file", crt_path, "--key-file", key_path,
+                "--fullchain-file", fc_path, NULL
+            };
+            rc = run_cmd("/root/.acme.sh/acme.sh", argv,
+                         output, sizeof(output));
+        }
     } else if (access("/usr/bin/certbot", X_OK) == 0) {
-        snprintf(cmd, sizeof(cmd),
-            "certbot certonly --standalone -d %s "
-            "--cert-path %s/%s.crt --key-path %s/%s.key "
-            "--non-interactive --agree-tos "
-            "%s%s "
-            "2>&1",
-            domain,
-            cert_dir, domain, cert_dir, domain,
-            email[0] ? "--email " : "--register-unsafely-without-email ",
-            email[0] ? email : "");
+        if (email[0]) {
+            char *const argv[] = {
+                "certbot", "certonly", "--standalone", "-d", (char *)domain,
+                "--cert-path", crt_path, "--key-path", key_path,
+                "--non-interactive", "--agree-tos",
+                "--email", (char *)email, NULL
+            };
+            rc = run_cmd("certbot", argv, output, sizeof(output));
+        } else {
+            char *const argv[] = {
+                "certbot", "certonly", "--standalone", "-d", (char *)domain,
+                "--cert-path", crt_path, "--key-path", key_path,
+                "--non-interactive", "--agree-tos",
+                "--register-unsafely-without-email", NULL
+            };
+            rc = run_cmd("certbot", argv, output, sizeof(output));
+        }
     } else {
-        /* Fallback: use openssl for self-signed */
-        snprintf(cmd, sizeof(cmd),
-            "openssl req -x509 -newkey rsa:2048 "
-            "-keyout %s/%s.key -out %s/%s.crt "
-            "-days 365 -nodes -subj '/CN=%s' 2>&1",
-            cert_dir, domain, cert_dir, domain, domain);
+        /* Fallback: self-signed via openssl. */
+        char *const argv[] = {
+            "openssl", "req", "-x509", "-newkey", "rsa:2048",
+            "-keyout", key_path, "-out", crt_path,
+            "-days", "365", "-nodes", "-subj", subj, NULL
+        };
+        rc = run_cmd("openssl", argv, output, sizeof(output));
     }
 
-    FILE *fp = popen(cmd, "r");
-    if (!fp) return -1;
-    char output[4096] = "";
-    size_t rd = fread(output, 1, sizeof(output) - 1, fp);
-    output[rd] = '\0';
-    int status = pclose(fp);
-
-    if (WEXITSTATUS(status) == 0) {
+    if (rc == 0) {
         g_core->log(g_core, PORTAL_LOG_INFO, "acme",
                     "Certificate issued for %s", domain);
         return 0;
     }
-
     g_core->log(g_core, PORTAL_LOG_ERROR, "acme",
-                "Certificate request failed for %s: %s", domain, output);
+                "Certificate request failed for %s (rc=%d): %s",
+                domain, rc, output);
     return -1;
 }
 
 /* Check if certificate needs renewal */
 static int needs_renewal(const char *cert_file, int days)
 {
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd),
-        "openssl x509 -in %s -checkend %d -noout 2>/dev/null",
-        cert_file, days * 86400);
-    int rc = system(cmd);
-    return WEXITSTATUS(rc) != 0;  /* non-zero = expiring soon */
+    char days_secs[32];
+    snprintf(days_secs, sizeof(days_secs), "%d", days * 86400);
+    char *const argv[] = {
+        "openssl", "x509", "-in", (char *)cert_file,
+        "-checkend", days_secs, "-noout", NULL
+    };
+    int rc = run_cmd("openssl", argv, NULL, 0);
+    return rc != 0;  /* non-zero = expiring soon */
 }
 
 int portal_module_load(portal_core_t *core)

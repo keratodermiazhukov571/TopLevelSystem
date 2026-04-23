@@ -112,6 +112,7 @@ static struct {
     char shell_advertise_host[128];
     char shell_login_binary[128];
     int  shell_dial_timeout;
+    int  shell_disable_direct_target;   /* reject incoming DIRECT shell connections */
 } g_cfg;
 
 static portal_core_t *g_core;
@@ -864,8 +865,22 @@ static void *accept_handler_thread(void *arg)
     if (pos == 0) goto bail;
 
     /* DIRECT mode — initiator opened TCP to our shell_port because
-     * ITS side is behind NAT / not reachable. We run the PTY locally. */
+     * ITS side is behind NAT / not reachable. We run the PTY locally.
+     *
+     * On the hub (or any node that should NOT be a shell target for
+     * other peers — devices reaching us via the federation port should
+     * never pop /bin/su without going through Portal auth), the operator
+     * sets shell_disable_direct_target = true to reject DIRECT entirely.
+     * Dial-back (session_id) still works because it requires a
+     * pre-registered pending_shell created by an authenticated
+     * /shell/functions/open_remote call on this side. */
     if (strncmp(line, "DIRECT", 6) == 0 && (line[6] == '\0' || line[6] == ' ')) {
+        if (g_cfg.shell_disable_direct_target) {
+            g_core->log(g_core, PORTAL_LOG_WARN, "shell",
+                        "direct: incoming DIRECT request DENIED "
+                        "(shell_disable_direct_target=true)");
+            goto bail;
+        }
         int rows = 24, cols = 80;
         if (line[6] == ' ') {
             if (sscanf(line + 7, "%d %d", &rows, &cols) != 2) {
@@ -1640,6 +1655,15 @@ int portal_module_load(portal_core_t *core)
     g_cfg.shell_dial_timeout = v ? atoi(v) : 10;
     if (g_cfg.shell_dial_timeout < 1) g_cfg.shell_dial_timeout = 1;
     if (g_cfg.shell_dial_timeout > 60) g_cfg.shell_dial_timeout = 60;
+
+    /* Reject incoming "DIRECT" mode connections — only dial-back
+     * (session_id matched against pending_shell created by an
+     * authenticated /shell/functions/open_remote on this side) is
+     * accepted. Set true on hubs that should not be a shell target for
+     * other peers; leave false (default) on devices. */
+    v = core->config_get(core, "shell", "shell_disable_direct_target");
+    g_cfg.shell_disable_direct_target = (v && (atoi(v) != 0 ||
+        strcasecmp(v, "true") == 0 || strcasecmp(v, "yes") == 0)) ? 1 : 0;
 
 #ifdef HAS_SSL
     if (g_cfg.shell_port > 0) {

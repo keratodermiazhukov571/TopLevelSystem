@@ -173,6 +173,15 @@ typedef struct {
      * peer until now_us() >= next_retry_us. */
     int            retry_count;
     uint64_t       next_retry_us;
+
+    /* Federation identity exchange (federation_strict_identity).
+     * Set by handle_identity_proof (responder side) and the post-handshake
+     * initiator hook in finalize_handshake. Read by the inbound dispatch
+     * wrapper to attribute messages from this peer to a local user.
+     * Cleared on disconnect by mark_peer_dead_by_fd. */
+    char            resolved_user[PORTAL_MAX_LABEL_LEN];
+    portal_labels_t resolved_labels;
+    int             identity_exchanged;
 } node_peer_t;
 
 typedef struct {
@@ -1103,6 +1112,185 @@ static node_peer_t *find_peer_any(const char *name)
     return NULL;
 }
 
+/* Federation identity (always on as of Phase 5).
+ *
+ * Peers exchange keys at handshake time via /node/functions/identity_proof.
+ * Each side resolves the other's key against its local auth registry and
+ * stores the resulting local user on the peer struct. Subsequent inbound
+ * messages from that peer are dispatched as the resolved local user (or
+ * anonymous if no key matched), not as the wire's self-declared identity.
+ *
+ * Phase 5 (2026-04-19) removed the `federation_strict_identity` opt-in
+ * knob and the legacy "promote every federated message to local root"
+ * compat path. Federation peers must now exchange identity to be anything
+ * other than anonymous. The shared `federation_key` retains its narrower
+ * role: gating who can join the mesh at handshake. The two
+ * federation_default_outbound_user / federation_default_inbound_user
+ * compat-mode knobs are also gone — their use case (asymmetric trust
+ * without per-peer key provisioning) is now covered by the always-on
+ * exchange + the peer_keys map. */
+
+#define NODE_PEER_KEY_MAX 2048
+typedef struct {
+    char name[PORTAL_MAX_MODULE_NAME];
+    char key[256];
+} peer_key_entry_t;
+static peer_key_entry_t g_peer_keys[NODE_PEER_KEY_MAX];
+static int              g_peer_key_count = 0;
+static char             g_peer_default_key[256] = "";
+
+/* Optional opt-in escape hatch (post-Phase 5). When set, inbound
+ * federation messages from a peer that did NOT complete identity_proof
+ * (peer is anonymous to us) are stamped with this local user's name and
+ * labels instead of NULL. Used on devices that trust the hub implicitly
+ * — devices have a single peer, gated by the shared federation_key, and
+ * cannot easily bootstrap per-peer identity (root=0 dev boxes have no
+ * carrier-bot, the api_key field truncates SHA-512 passwords, etc.).
+ *
+ * MUST NOT be set on the hub or any multi-peer node — it would make any
+ * peer that knows federation_key inherit this user's privileges.
+ *
+ * Resolved once at module load; the labels are cached so per-message
+ * stamping is allocation-free. */
+static char            g_federation_inbound_default_user[PORTAL_MAX_LABEL_LEN] = "";
+static portal_labels_t g_federation_inbound_default_labels;
+static int             g_federation_inbound_default_resolved = 0;
+
+/* Look up our outbound key for `peer_name`. Per-peer override first, then
+ * the default, then NULL. Returns a pointer into static storage. */
+static const char *peer_outbound_key(const char *peer_name)
+{
+    if (!peer_name) return NULL;
+    for (int i = 0; i < g_peer_key_count; i++) {
+        if (strcmp(g_peer_keys[i].name, peer_name) == 0)
+            return g_peer_keys[i].key;
+    }
+    if (g_peer_default_key[0]) return g_peer_default_key;
+    return NULL;
+}
+
+/* Add or update a single peer key entry at runtime. Used by the
+ * /node/functions/set_peer_key handler (Phase 2c) so mod_ssip_hub can
+ * push per-device keys into the live map without a portal restart.
+ * Returns 0 on success, -1 if the table is full and the name is new. */
+static int peer_keys_set_one(const char *name, const char *key)
+{
+    if (!name || !name[0] || !key || !key[0]) return -1;
+    for (int i = 0; i < g_peer_key_count; i++) {
+        if (strcmp(g_peer_keys[i].name, name) == 0) {
+            snprintf(g_peer_keys[i].key, sizeof(g_peer_keys[i].key),
+                     "%s", key);
+            return 0;
+        }
+    }
+    if (g_peer_key_count >= NODE_PEER_KEY_MAX) return -1;
+    peer_key_entry_t *e = &g_peer_keys[g_peer_key_count++];
+    snprintf(e->name, sizeof(e->name), "%s", name);
+    snprintf(e->key,  sizeof(e->key),  "%s", key);
+    return 0;
+}
+
+/* Parse the `peer_keys` config string into g_peer_keys[]. Format mirrors
+ * peer_labels: comma-separated `<peer_name>:<hex-key>` pairs. Idempotent;
+ * each call fully rebuilds the table. Silently ignores malformed entries. */
+static void peer_keys_load(const char *cfg)
+{
+    g_peer_key_count = 0;
+    if (!cfg || !cfg[0]) return;
+
+    char buf[8192];
+    snprintf(buf, sizeof(buf), "%s", cfg);
+
+    char *saveptr = NULL;
+    for (char *tok = strtok_r(buf, ",", &saveptr);
+         tok && g_peer_key_count < NODE_PEER_KEY_MAX;
+         tok = strtok_r(NULL, ",", &saveptr)) {
+        while (*tok == ' ' || *tok == '\t') tok++;
+        char *colon = strchr(tok, ':');
+        if (!colon || colon == tok) continue;
+        *colon = '\0';
+        char *key = colon + 1;
+        while (*key == ' ' || *key == '\t') key++;
+        if (!*key) continue;
+
+        peer_key_entry_t *e = &g_peer_keys[g_peer_key_count++];
+        snprintf(e->name, sizeof(e->name), "%s", tok);
+        snprintf(e->key, sizeof(e->key), "%s", key);
+    }
+}
+
+/* Law 15 — per-peer label map.
+ *
+ * Populated at module load from the `peer_labels` config entry, which is a
+ * comma-separated list of `<peer_name>:<label1>+<label2>+...` pairs. Used by
+ * peer_get_labels() to attach Law 15 labels to each connected peer without
+ * altering the handshake protocol. Generic — no knowledge of SSIP or any
+ * other tenant.
+ *
+ * A peer not listed in this map has no labels and is therefore visible to
+ * everyone (permissive default, per Law 15). An operator of a multi-tenant
+ * hub lists every peer they want scoped.
+ */
+#define NODE_PEER_LABEL_MAX 512
+typedef struct {
+    char             name[PORTAL_MAX_MODULE_NAME];
+    portal_labels_t  labels;
+} peer_label_entry_t;
+static peer_label_entry_t g_peer_labels[NODE_PEER_LABEL_MAX];
+static int                g_peer_label_count = 0;
+
+/* Parse the `peer_labels` config string into g_peer_labels[]. Idempotent:
+ * each call fully rebuilds the table. Silently ignores malformed entries
+ * and caps at NODE_PEER_LABEL_MAX. */
+static void peer_labels_load(const char *cfg)
+{
+    g_peer_label_count = 0;
+    if (!cfg || !cfg[0]) return;
+
+    char buf[4096];
+    snprintf(buf, sizeof(buf), "%s", cfg);
+
+    char *saveptr = NULL;
+    for (char *tok = strtok_r(buf, ",", &saveptr);
+         tok && g_peer_label_count < NODE_PEER_LABEL_MAX;
+         tok = strtok_r(NULL, ",", &saveptr)) {
+        while (*tok == ' ' || *tok == '\t') tok++;
+        char *colon = strchr(tok, ':');
+        if (!colon || colon == tok) continue;   /* skip malformed */
+        *colon = '\0';
+        char *labels_str = colon + 1;
+
+        peer_label_entry_t *e = &g_peer_labels[g_peer_label_count];
+        snprintf(e->name, sizeof(e->name), "%s", tok);
+        memset(&e->labels, 0, sizeof(e->labels));
+
+        char *lsave = NULL;
+        for (char *l = strtok_r(labels_str, "+", &lsave); l;
+             l = strtok_r(NULL, "+", &lsave)) {
+            while (*l == ' ' || *l == '\t') l++;
+            if (*l) portal_labels_add(&e->labels, l);
+        }
+        g_peer_label_count++;
+    }
+}
+
+/* Law 15 — row-label getter for a peer.
+ * Looks up `p->name` in the static peer-label map. Misses return the empty
+ * label set (peer is public to anyone). When per-peer authenticated identity
+ * lands later (federation_auth=user), this can switch to reading the
+ * authenticated user's labels directly without changing the call site. */
+static void peer_get_labels(const node_peer_t *p, portal_labels_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    if (!p) return;
+    for (int i = 0; i < g_peer_label_count; i++) {
+        if (strcmp(g_peer_labels[i].name, p->name) == 0) {
+            memcpy(out, &g_peer_labels[i].labels, sizeof(*out));
+            return;
+        }
+    }
+}
+
 /* Get current time in microseconds */
 static uint64_t now_us(void)
 {
@@ -1814,6 +2002,77 @@ static void finalize_handshake(rx_state_t *rx)
                         "Connected to peer '%s' at %s:%d (async, %d workers)%s",
                         peer->name, peer->host, peer->port,
                         g_threads_per_peer, tls_tag);
+
+            /* Federation strict-identity exchange (initiator side).
+             *
+             * Now that the PORTAL02 handshake is complete and the peer is
+             * registered, run the identity exchange on a separate Portal
+             * round-trip. We're the initiator: we send our outbound key
+             * for this peer first, and only on a successful response do
+             * we read back the peer's key and resolve it locally.
+             *
+             * This call is synchronous: core->send routes through this same
+             * mod_node, peer_send_wait drives a nested ev_run, and we get
+             * the response before returning. The handshake-completion path
+             * already runs on the event loop, so re-entering it for one
+             * synchronous round-trip is safe — the same pattern is used by
+             * /node/functions/ping etc. (see peer_send_wait usage). */
+            {
+                const char *our_key = peer_outbound_key(peer->name);
+                if (our_key && our_key[0]) {
+                    portal_msg_t  *m = portal_msg_alloc();
+                    portal_resp_t *r = portal_resp_alloc();
+                    if (m && r) {
+                        char ipath[PORTAL_MAX_PATH_LEN];
+                        snprintf(ipath, sizeof(ipath),
+                                 "/%s/node/functions/identity_proof",
+                                 peer->name);
+                        portal_msg_set_path(m, ipath);
+                        portal_msg_set_method(m, PORTAL_METHOD_CALL);
+                        portal_msg_add_header(m, "key", our_key);
+                        int xrc = g_core->send(g_core, m, r);
+                        if (xrc == 0 && r->status == PORTAL_OK &&
+                            r->body && r->body_len > 0) {
+                            /* Body is the peer's outbound key for us. */
+                            const char *their_key = (const char *)r->body;
+                            char  their_user[PORTAL_MAX_LABEL_LEN];
+                            portal_labels_t their_labels = {0};
+                            int found = g_core->auth_find_by_key(g_core,
+                                their_key, their_user, sizeof(their_user),
+                                &their_labels);
+                            if (found) {
+                                snprintf(peer->resolved_user,
+                                         sizeof(peer->resolved_user),
+                                         "%s", their_user);
+                                memcpy(&peer->resolved_labels, &their_labels,
+                                       sizeof(portal_labels_t));
+                                peer->identity_exchanged = 1;
+                                g_core->log(g_core, PORTAL_LOG_INFO, "node",
+                                    "Identity exchange ok with peer '%s' "
+                                    "→ local user '%s'",
+                                    peer->name, their_user);
+                            } else {
+                                g_core->log(g_core, PORTAL_LOG_WARN, "node",
+                                    "Peer '%s' returned key that does not "
+                                    "match any local user — peer is anonymous "
+                                    "to us", peer->name);
+                            }
+                        } else {
+                            g_core->log(g_core, PORTAL_LOG_WARN, "node",
+                                "Identity exchange with '%s' failed "
+                                "(rc=%d status=%d)",
+                                peer->name, xrc,
+                                r ? (int)r->status : -1);
+                        }
+                    }
+                    portal_msg_free(m);
+                    portal_resp_free(r);
+                } else {
+                    g_core->log(g_core, PORTAL_LOG_WARN, "node",
+                        "No outbound key configured for peer '%s' — "
+                        "we will be anonymous to them", peer->name);
+                }
+            }
 
             /* Register indirect peers advertised during handshake */
             int hub_idx = -1;
@@ -2540,6 +2799,7 @@ read_more:
             if (incoming.ctx) {
                 free(incoming.ctx->auth.user);
                 free(incoming.ctx->auth.token);
+                free(incoming.ctx->source_node);
                 free(incoming.ctx);
             }
             /* start_pipe took ownership of the fd and called fd_del,
@@ -2588,6 +2848,7 @@ read_more:
             if (incoming.ctx) {
                 free(incoming.ctx->auth.user);
                 free(incoming.ctx->auth.token);
+                free(incoming.ctx->source_node);
                 free(incoming.ctx);
             }
             /* start_shell took ownership of the fd and called fd_del,
@@ -2603,19 +2864,65 @@ read_more:
                 src_peer->bytes_recv += incoming.body_len;
         }
 
-        /* Federation trust: the peer already authenticated via federation_key
-         * during the TLS handshake. Attach local root credentials so the
-         * core router grants full access to federated requests. Without this,
-         * the remote user's token (from a different node's user DB) would
-         * fail the local auth check → ACCESS DENIED. */
-        if (g_federation_key[0]) {
-            if (!incoming.ctx)
-                incoming.ctx = calloc(1, sizeof(portal_ctx_t));
-            if (incoming.ctx) {
-                free(incoming.ctx->auth.user);
-                free(incoming.ctx->auth.token);
-                incoming.ctx->auth.user = strdup("root");
-                incoming.ctx->auth.token = strdup("__federation__");
+        /* Identity attribution for this inbound federation message.
+         *
+         * Identity comes from the per-peer state set during the handshake-
+         * time /node/functions/identity_proof exchange. If exchange didn't
+         * run or the peer's key didn't validate against our local registry,
+         * the peer is anonymous from our perspective — downstream ACL
+         * denies labeled paths and Law 15 denies labeled rows.
+         *
+         * source_node is set so handlers (notably the identity_proof
+         * handler itself) can identify which peer sent the message — info
+         * the wire codec doesn't carry. */
+        if (!incoming.ctx)
+            incoming.ctx = calloc(1, sizeof(portal_ctx_t));
+        if (incoming.ctx) {
+            free(incoming.ctx->auth.user);
+            free(incoming.ctx->auth.token);
+            portal_labels_clear(&incoming.ctx->auth.labels);
+            if (src_peer && src_peer->identity_exchanged) {
+                incoming.ctx->auth.user  = strdup(src_peer->resolved_user);
+                incoming.ctx->auth.token = NULL;
+                memcpy(&incoming.ctx->auth.labels,
+                       &src_peer->resolved_labels,
+                       sizeof(portal_labels_t));
+            } else if (g_federation_inbound_default_resolved) {
+                /* Opt-in fallback (see g_federation_inbound_default_user). */
+                incoming.ctx->auth.user  = strdup(g_federation_inbound_default_user);
+                incoming.ctx->auth.token = NULL;
+                memcpy(&incoming.ctx->auth.labels,
+                       &g_federation_inbound_default_labels,
+                       sizeof(portal_labels_t));
+            } else {
+                incoming.ctx->auth.user  = NULL;
+                incoming.ctx->auth.token = NULL;
+            }
+            if (src_peer) {
+                free(incoming.ctx->source_node);
+                incoming.ctx->source_node = strdup(src_peer->name);
+            }
+        }
+
+        /* Law 12 — Universal Resource Names — transparent self-prefix strip.
+         * If the inbound federation message is addressed with our own node
+         * name as the first segment, strip it so the local router re-dispatches
+         * against the remainder. Lets callers use recursive peer paths like
+         * /<self>/<other_peer>/... — we act as a transparent router without
+         * requiring advertise_peers to leak the peer list. One self-strip
+         * per inbound hop; the next hop does its own. */
+        if (incoming.path && incoming.path[0] == '/' && g_node_name[0]) {
+            size_t nlen = strlen(g_node_name);
+            if (strncmp(incoming.path + 1, g_node_name, nlen) == 0 &&
+                incoming.path[1 + nlen] == '/') {
+                size_t rest_len = strlen(incoming.path) - (1 + nlen);
+                char *stripped = malloc(rest_len + 1);
+                if (stripped) {
+                    memcpy(stripped, incoming.path + 1 + nlen, rest_len);
+                    stripped[rest_len] = '\0';
+                    free(incoming.path);
+                    incoming.path = stripped;
+                }
             }
         }
 
@@ -2655,6 +2962,7 @@ read_more:
         if (incoming.ctx) {
             free(incoming.ctx->auth.user);
             free(incoming.ctx->auth.token);
+            free(incoming.ctx->source_node);
             free(incoming.ctx);
         }
         free(resp.body);
@@ -2736,6 +3044,20 @@ static void mark_peer_dead_by_fd(int fd)
             if (!p->dead) {
                 p->dead = 1;
                 p->ready = 0;
+                /* Federation strict identity: clear the resolved identity so
+                 * the next reconnect re-runs the identity_proof exchange. */
+                p->identity_exchanged = 0;
+                p->resolved_user[0] = '\0';
+                portal_labels_clear(&p->resolved_labels);
+                /* Unregister the federation wildcard path so reconnect can
+                 * re-register without hitting "duplicate" — otherwise
+                 * /<peer>/(wildcard) lookups land on a stale entry that no
+                 * longer routes to a live worker, and dispatchers 404. */
+                for (int pi = 0; pi < p->path_count; pi++) {
+                    if (p->paths[pi][0])
+                        g_core->path_unregister(g_core, p->paths[pi]);
+                }
+                p->path_count = 0;
                 g_core->log(g_core, PORTAL_LOG_WARN, "node",
                             "Peer '%s' connection lost", p->name);
                 /* Cascade: indirect peers through this hub are also dead */
@@ -2743,6 +3065,15 @@ static void mark_peer_dead_by_fd(int fd)
                     if (g_peers[k]->is_indirect && g_peers[k]->hub_idx == i) {
                         g_peers[k]->dead = 1;
                         g_peers[k]->ready = 0;
+                        g_peers[k]->identity_exchanged = 0;
+                        g_peers[k]->resolved_user[0] = '\0';
+                        portal_labels_clear(&g_peers[k]->resolved_labels);
+                        for (int pi = 0; pi < g_peers[k]->path_count; pi++) {
+                            if (g_peers[k]->paths[pi][0])
+                                g_core->path_unregister(g_core,
+                                                        g_peers[k]->paths[pi]);
+                        }
+                        g_peers[k]->path_count = 0;
                         g_core->log(g_core, PORTAL_LOG_WARN, "node",
                                     "Indirect peer '%s' lost (hub '%s' down)",
                                     g_peers[k]->name, p->name);
@@ -2765,6 +3096,13 @@ static void mark_peer_dead_by_fd(int fd)
                 if (p->worker_count == 0 && p->ctrl_fd < 0) {
                     p->dead = 1;
                     p->ready = 0;
+                    /* Match the ctrl_fd-loss path: unregister the federation
+                     * wildcard so reconnect can re-register cleanly. */
+                    for (int pi = 0; pi < p->path_count; pi++) {
+                        if (p->paths[pi][0])
+                            g_core->path_unregister(g_core, p->paths[pi]);
+                    }
+                    p->path_count = 0;
                     g_core->log(g_core, PORTAL_LOG_WARN, "node",
                                 "Peer '%s' all workers lost", p->name);
                 }
@@ -3360,6 +3698,52 @@ int portal_module_load(portal_core_t *core)
     v = core->config_get(core, "node", "advertise_to");
     if (v) snprintf(g_advertise_to, sizeof(g_advertise_to), "%s", v);
 
+    /* Law 15 — peer label map (optional). See peer_labels_load() comment. */
+    v = core->config_get(core, "node", "peer_labels");
+    peer_labels_load(v);
+    if (g_peer_label_count > 0)
+        core->log(core, PORTAL_LOG_INFO, "node",
+                  "Loaded %d peer label entries (Law 15)", g_peer_label_count);
+
+    /* Federation per-peer outbound keys (always-on as of Phase 5). The
+     * compat knobs federation_strict_identity, federation_default_outbound_user
+     * and federation_default_inbound_user are accepted for backward compat
+     * with older config files but ignored — we always run identity exchange
+     * and never promote inbound to root. */
+    v = core->config_get(core, "node", "peer_default_key");
+    if (v)
+        snprintf(g_peer_default_key, sizeof(g_peer_default_key), "%s", v);
+    v = core->config_get(core, "node", "peer_keys");
+    peer_keys_load(v);
+    core->log(core, PORTAL_LOG_INFO, "node",
+              "Federation identity ON (peer keys: %d, default: %s)",
+              g_peer_key_count,
+              g_peer_default_key[0] ? "set" : "unset");
+
+    /* Opt-in escape hatch: stamp anonymous inbound federation peers as
+     * a configured local user. Resolve labels once at load. */
+    v = core->config_get(core, "node", "federation_inbound_default_user");
+    if (v && v[0]) {
+        snprintf(g_federation_inbound_default_user,
+                 sizeof(g_federation_inbound_default_user), "%s", v);
+        portal_labels_clear(&g_federation_inbound_default_labels);
+        if (core->auth_find_user &&
+            core->auth_find_user(core, v,
+                                  &g_federation_inbound_default_labels)) {
+            g_federation_inbound_default_resolved = 1;
+            core->log(core, PORTAL_LOG_WARN, "node",
+                      "federation_inbound_default_user='%s' (labels: %d) — "
+                      "anonymous federation peers will be stamped as this "
+                      "user. DO NOT enable on multi-peer nodes.",
+                      v, g_federation_inbound_default_labels.count);
+        } else {
+            core->log(core, PORTAL_LOG_WARN, "node",
+                      "federation_inbound_default_user='%s' configured but "
+                      "user not found locally — fallback disabled", v);
+            g_federation_inbound_default_user[0] = '\0';
+        }
+    }
+
     /* Default cert paths from instance certs/ directory */
     if (g_tls_enabled && g_cert_file[0] == '\0') {
         const char *data_dir = core->config_get(core, "core", "data_dir");
@@ -3459,6 +3843,21 @@ int portal_module_load(portal_core_t *core)
     core->path_register(core, "/node/functions/trace", "node");
     core->path_set_access(core, "/node/functions/trace", PORTAL_ACCESS_RW);
     core->path_set_description(core, "/node/functions/trace", "Traceroute through federation. Header: path");
+    /* Open access by design: federation peers must be able to call this
+     * BEFORE their identity is established, since this is the call that
+     * establishes their identity. Validation happens inside the handler.
+     * See plan: federation strict identity exchange. */
+    core->path_register(core, "/node/functions/identity_proof", "node");
+    core->path_set_access(core, "/node/functions/identity_proof", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/node/functions/identity_proof",
+        "Federation identity exchange. Header: key. Response: key (peer's outbound to us).");
+    /* Runtime peer-key mutation (Phase 2c) — admin-or-internal gated by
+     * the handler. Used by mod_ssip_hub to push the per-device outbound
+     * keys into mod_node's in-memory g_peer_keys map without restart. */
+    core->path_register(core, "/node/functions/set_peer_key", "node");
+    core->path_set_access(core, "/node/functions/set_peer_key", PORTAL_ACCESS_RW);
+    core->path_set_description(core, "/node/functions/set_peer_key",
+        "Add/update a runtime peer key. Headers: peer_name, key. Admin-only.");
 #ifdef HAS_SSL
     core->path_register(core, "/node/functions/reload_tls", "node");
     core->path_set_access(core, "/node/functions/reload_tls", PORTAL_ACCESS_RW);
@@ -4158,6 +4557,13 @@ int portal_module_handle(portal_core_t *core, const portal_msg_t *msg,
         off += (size_t)snprintf(buf + off, sizeof(buf) - off, "Connected peers:\n");
         for (int i = 0; i < g_peer_count; i++) {
             node_peer_t *p = g_peers[i];
+
+            /* Law 15 — skip peers the caller can't see. */
+            portal_labels_t row_labels;
+            peer_get_labels(p, &row_labels);
+            if (!core->labels_allow(core, msg->ctx, &row_labels))
+                continue;
+
             int busy = 0;
             for (int j = 0; j < p->worker_count; j++)
                 if (p->workers[j].busy) busy++;
@@ -4204,10 +4610,23 @@ int portal_module_handle(portal_core_t *core, const portal_msg_t *msg,
 
         node_peer_t *p = find_peer_any(pname);
         if (!p) {
-            char buf[128];
-            int n = snprintf(buf, sizeof(buf), "Peer '%s' not found\n", pname);
+            char nfbuf[128];
+            int nfn = snprintf(nfbuf, sizeof(nfbuf), "Peer '%s' not found\n", pname);
             portal_resp_set_status(resp, PORTAL_NOT_FOUND);
-            portal_resp_set_body(resp, buf, (size_t)n);
+            portal_resp_set_body(resp, nfbuf, (size_t)nfn);
+            return -1;
+        }
+
+        /* Law 15 — if the caller can't see this peer, return the same
+         * "not found" response used when the peer truly doesn't exist.
+         * Never distinguish "hidden" from "absent" to the caller. */
+        portal_labels_t row_labels;
+        peer_get_labels(p, &row_labels);
+        if (!core->labels_allow(core, msg->ctx, &row_labels)) {
+            char nfbuf[128];
+            int nfn = snprintf(nfbuf, sizeof(nfbuf), "Peer '%s' not found\n", pname);
+            portal_resp_set_status(resp, PORTAL_NOT_FOUND);
+            portal_resp_set_body(resp, nfbuf, (size_t)nfn);
             return -1;
         }
 
@@ -4260,6 +4679,117 @@ int portal_module_handle(portal_core_t *core, const portal_msg_t *msg,
     /* /node/functions/reconnect — called by cron */
     if (strcmp(msg->path, "/node/functions/reconnect") == 0) {
         reconnect_dead_peers();
+        portal_resp_set_status(resp, PORTAL_OK);
+        return 0;
+    }
+
+    /* /node/functions/identity_proof — federation strict-identity exchange.
+     *
+     * The initiator (peer that just completed the PORTAL02 handshake to us)
+     * presents its outbound key for us in the `key` header. We resolve it
+     * against our local auth registry. On match, we record the resolved
+     * local user on that peer's struct so subsequent inbound messages from
+     * the peer dispatch as that user (not as "root via federation_key").
+     * Then we reveal our outbound key for the same peer in the response
+     * body — strict initiator-first ordering: we don't reveal our key
+     * unless the initiator's validates first.
+     *
+     * Security: the path is registered with no labels (open access) because
+     * we cannot demand authenticated callers for the very call that
+     * establishes their authentication. The handler does its own validation. */
+    if (strcmp(msg->path, "/node/functions/identity_proof") == 0) {
+        const char *src_peer_name = (msg->ctx && msg->ctx->source_node)
+                                     ? msg->ctx->source_node : NULL;
+        const char *claimed_key = NULL;
+        for (uint16_t i = 0; i < msg->header_count; i++)
+            if (strcmp(msg->headers[i].key, "key") == 0)
+                claimed_key = msg->headers[i].value;
+
+        if (!src_peer_name || !claimed_key || !claimed_key[0]) {
+            portal_resp_set_status(resp, PORTAL_BAD_REQUEST);
+            return -1;
+        }
+
+        char local_user[PORTAL_MAX_LABEL_LEN];
+        portal_labels_t local_labels = {0};
+        int found = core->auth_find_by_key(core, claimed_key,
+                                           local_user, sizeof(local_user),
+                                           &local_labels);
+        if (!found) {
+            core->log(core, PORTAL_LOG_WARN, "node",
+                      "Identity exchange from peer '%s' rejected: "
+                      "key does not match any local user",
+                      src_peer_name);
+            portal_resp_set_status(resp, PORTAL_UNAUTHORIZED);
+            return -1;
+        }
+
+        node_peer_t *peer = find_peer_any(src_peer_name);
+        if (!peer) {
+            /* Should not happen — the message arrived through this peer's
+             * fd, so the peer must be registered. Defensive only. */
+            portal_resp_set_status(resp, PORTAL_INTERNAL_ERROR);
+            return -1;
+        }
+        snprintf(peer->resolved_user, sizeof(peer->resolved_user),
+                 "%s", local_user);
+        memcpy(&peer->resolved_labels, &local_labels,
+               sizeof(portal_labels_t));
+        peer->identity_exchanged = 1;
+
+        core->log(core, PORTAL_LOG_INFO, "node",
+                  "Identity exchange ok with peer '%s' → local user '%s'",
+                  src_peer_name, local_user);
+
+        /* Reveal our outbound key for this peer (per-peer override or default).
+         * If we have no key, return 200 with empty body — the initiator
+         * will treat us as anonymous on their side. */
+        const char *our_key = peer_outbound_key(src_peer_name);
+        portal_resp_set_status(resp, PORTAL_OK);
+        if (our_key && our_key[0])
+            portal_resp_set_body(resp, our_key, strlen(our_key) + 1);
+        return 0;
+    }
+
+    /* /node/functions/set_peer_key — runtime add/update of an outbound
+     * peer key. Auth: NULL ctx (internal call from another module via
+     * core->send) OR root user OR caller carrying `hub-admin` label.
+     * Anonymous federation peers, low-priv users → 403. */
+    if (strcmp(msg->path, "/node/functions/set_peer_key") == 0) {
+        int allow = 0;
+        if (!msg->ctx) {
+            allow = 1;
+        } else if (msg->ctx->auth.user &&
+                    strcmp(msg->ctx->auth.user, "root") == 0) {
+            allow = 1;
+        } else if (portal_labels_has(&msg->ctx->auth.labels, "hub-admin")) {
+            allow = 1;
+        }
+        if (!allow) {
+            portal_resp_set_status(resp, PORTAL_FORBIDDEN);
+            return -1;
+        }
+
+        const char *peer_name = NULL, *key_val = NULL;
+        for (uint16_t i = 0; i < msg->header_count; i++) {
+            if (strcmp(msg->headers[i].key, "peer_name") == 0)
+                peer_name = msg->headers[i].value;
+            else if (strcmp(msg->headers[i].key, "key") == 0)
+                key_val = msg->headers[i].value;
+        }
+        if (!peer_name || !peer_name[0] || !key_val || !key_val[0]) {
+            portal_resp_set_status(resp, PORTAL_BAD_REQUEST);
+            return -1;
+        }
+        if (peer_keys_set_one(peer_name, key_val) < 0) {
+            portal_resp_set_status(resp, PORTAL_INTERNAL_ERROR);
+            const char *err = "peer key table full\n";
+            portal_resp_set_body(resp, err, strlen(err) + 1);
+            return -1;
+        }
+        core->log(core, PORTAL_LOG_INFO, "node",
+                  "Runtime peer key set for '%s' (%.8s...)",
+                  peer_name, key_val);
         portal_resp_set_status(resp, PORTAL_OK);
         return 0;
     }

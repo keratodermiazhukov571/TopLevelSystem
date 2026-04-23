@@ -141,6 +141,67 @@ struct portal_core {
      * Cast to (struct ev_loop *) to use with ev_run. */
     void *(*ev_loop_get)(portal_core_t *core);
 
+    /* Law 15 — group-scoped output filter.
+     *
+     * Returns 1 if a row bearing row_labels should be visible to ctx.
+     * Modules that iterate and emit rows call this per row and `continue`
+     * on 0. See docs/PHILOSOPHY.md (Law 15) and docs/MODULE_GUIDE.md.
+     *
+     * Rules applied in order:
+     *   1. ctx is NULL                                → allowed (internal call).
+     *   2. ctx->auth.user == "root"                   → allowed (bypass).
+     *   3. ctx has label "sys.see_all"                → allowed (audited
+     *                                                   via /events/acl/bypass).
+     *   4. row_labels is NULL or row_labels->count==0 → allowed (public row).
+     *   5. otherwise                                   → label intersection.
+     */
+    int (*labels_allow)(portal_core_t *core,
+                        const portal_ctx_t *ctx,
+                        const portal_labels_t *row_labels);
+
+    /* Look up a local user by API key. Pure read — no session created.
+     * On match, copies the user's username into out_username (if non-NULL)
+     * and labels into out_labels (if non-NULL). Returns 1 on match, 0 on
+     * no match (or empty/NULL key). Used by mod_node for the federation
+     * identity exchange to resolve a peer-supplied key to a local user. */
+    int (*auth_find_by_key)(portal_core_t *core, const char *api_key,
+                             char *out_username, size_t out_username_sz,
+                             portal_labels_t *out_labels);
+
+    /* Ensure a Portal user exists with the given username, labels, and
+     * api_key; persist (storage + KV store) on creation.
+     *
+     *   key = NULL  → on create, generate a random api_key; on existing
+     *                 user, leave its api_key alone.
+     *   key != NULL → on create OR update, use this key verbatim as the
+     *                 user's api_key (and persist the change). Use when
+     *                 the api_key must equal a pre-existing secret such
+     *                 as /etc/ssippwd on SSIP devices, so federation
+     *                 messages from the hub (which already knows that
+     *                 secret) resolve to this user.
+     *
+     * The labels argument applies only on creation — it is not merged
+     * into an existing user's label set. NULL labels → user created with
+     * no labels.
+     *
+     * On success, out_key (if non-NULL) is populated with the user's
+     * api_key (the generated one, the supplied one, or the pre-existing
+     * one).
+     *
+     * Returns 1 if newly created, 0 if it already existed, -1 on error. */
+    int (*auth_ensure_user)(portal_core_t *core,
+                             const char *username,
+                             const portal_labels_t *labels,
+                             const char *key,
+                             char *out_key, size_t out_key_sz);
+
+    /* Pure lookup of a Portal user by username. On match, copies the
+     * user's labels into out_labels (if non-NULL). Returns 1 on match,
+     * 0 on no match (or NULL/empty username). Used by mod_node to
+     * resolve federation_default_local_user at inbound dispatch time. */
+    int (*auth_find_user)(portal_core_t *core, const char *username,
+                           portal_labels_t *out_labels);
+
     /* Opaque internal state — modules must not touch */
     void *_internal;
 };

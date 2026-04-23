@@ -504,6 +504,13 @@ static void cmd_core_get(int fd, const char *path)
             }
         }
 
+        /* Attach the CLI session's authenticated identity so label-
+         * gated paths (admin, etc.) see the logged-in user instead of
+         * "anonymous". Without this a logged-in operator running e.g.
+         * `get /ssip/hub/functions/update_advance?...` was denied by
+         * the core's ACL even though they have the admin group. */
+        cli_attach_auth(fd, msg);
+
         int rc = g_core->send(g_core, msg, resp);
         if (rc == 0 && resp->body) {
             size_t blen = resp->body_len;
@@ -604,6 +611,8 @@ static void cmd_cd(int fd, const char *target)
     g_core->send(g_core, msg, resp);
     if (resp->status == PORTAL_OK && resp->body)
         snprintf(c->cwd, sizeof(c->cwd), "%s", (char *)resp->body);
+    else if (resp->status == PORTAL_NOT_FOUND)
+        send_str(fd, "No such path\n");
 
     portal_msg_free(msg);
     portal_resp_free(resp);
@@ -1554,11 +1563,44 @@ static void handle_command(int fd, char *line)
         remove_client(fd);
         return;
     } else {
+        /* Law 12 — cwd-aware shortcut rewrite. A small set of shortcut
+         * commands always map to a fixed resource path (sysinfo → sysinfo/
+         * resources/all, etc.). When the user is inside a non-root cwd
+         * (e.g., /ssip-hub/ssip867), intercept the shortcut and route it
+         * through the cwd-aware `get` path so it hits the remote peer's
+         * namespace instead of always hitting the local node. Rewrite is
+         * local to mod_cli — no external module/ABI involvement. */
+        static const struct { const char *word; const char *path; } cwd_shortcuts[] = {
+            {"sysinfo", "sysinfo/resources/all"},
+            {"uptime",  "sysinfo/resources/os"},
+            {"health",  "health/resources/checks"},
+            {"metrics", "metrics/resources/system"},
+            {NULL, NULL}
+        };
+        cli_client_t *gc_ns = find_client(fd);
+        int rewritten = 0;
+        if (gc_ns && gc_ns->cwd[0] && strcmp(gc_ns->cwd, "/") != 0) {
+            for (int i = 0; cwd_shortcuts[i].word; i++) {
+                if (strcmp(line, cwd_shortcuts[i].word) == 0) {
+                    char resolved[PORTAL_MAX_PATH_LEN * 2];
+                    snprintf(resolved, sizeof(resolved), "%s/%s",
+                             gc_ns->cwd, cwd_shortcuts[i].path);
+                    cmd_core_get(fd, resolved);
+                    rewritten = 1;
+                    break;
+                }
+            }
+        }
+
         /* Try registered CLI commands (modules register via portal_cli_register) */
         const char *cli_args = NULL;
-        portal_cli_entry_t *cli_entry = portal_cli_find(g_core, line, &cli_args);
+        portal_cli_entry_t *cli_entry = rewritten ? NULL :
+                                        portal_cli_find(g_core, line, &cli_args);
         if (cli_entry && cli_entry->handler) {
             cli_entry->handler(g_core, fd, line, cli_args ? cli_args : "");
+        }
+        else if (rewritten) {
+            /* already handled */
         }
         /* Try treating the unknown command as a path: get /<line> */
         else if (line[0] != '/' && strchr(line, ' ') == NULL && strlen(line) > 1) {
@@ -1769,6 +1811,33 @@ static void editor_tab_complete(int fd, cli_client_t *c)
     /* Find the path token to complete */
     char *last_space = strrchr(line, ' ');
     char *word = last_space ? last_space + 1 : line;
+
+    /* cd/ls/get <relative> — resolve the relative word against the
+     * current cwd, then let the absolute-path completion code below
+     * run normally. Without this, typing `cd ssip<TAB>` at / or
+     * `cd gate<TAB>` inside /ssip867 silently did nothing because the
+     * path-completion block only triggers when word starts with '/'. */
+    char abs_word_buf[PORTAL_MAX_PATH_LEN];
+    if (word[0] != '/' && last_space) {
+        char first[16];
+        size_t flen = (size_t)(last_space - line);
+        if (flen < sizeof(first)) {
+            memcpy(first, line, flen);
+            first[flen] = '\0';
+            if (strcmp(first, "cd") == 0 || strcmp(first, "ls") == 0 ||
+                strcmp(first, "get") == 0) {
+                int n;
+                if (strcmp(c->cwd, "/") == 0)
+                    n = snprintf(abs_word_buf, sizeof(abs_word_buf),
+                                 "/%.511s", word);
+                else
+                    n = snprintf(abs_word_buf, sizeof(abs_word_buf),
+                                 "%.511s/%.511s", c->cwd, word);
+                if (n > 0 && (size_t)n < sizeof(abs_word_buf))
+                    word = abs_word_buf;
+            }
+        }
+    }
 
     /* Context-aware completion for commands that take device/peer names */
     if (word[0] != '/' && last_space) {

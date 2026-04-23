@@ -17,7 +17,29 @@
 
 # Portal v1.0.0
 
-**Universal Modular Core** — A minimal C microkernel that connects hot-loadable modules through path-based message routing. Everything is a path. Every interaction is a message.
+**Universal Modular Core** — A minimal C microkernel that connects hot-loadable modules through path-based message routing. **Everything is a path. Every interaction is a message. One ACL, one event bus, one wire format — across CLI, HTTP, TLS, and a peer-to-peer federation that scales to hundreds of nodes.**
+
+> 🔐 **Security model**: see [`docs/SECURITY.md`](docs/SECURITY.md) — single source of truth for identity, label-based ACL, output filtering, federation identity exchange, mutation gate, encryption, audit, operator runbooks, and threat model.
+>
+> 🛠️ **Coding rules**: see [`docs/CODING.md`](docs/CODING.md) — mandatory for every line of C in this repo. Write less, check everything, fail closed.
+>
+> 📰 **What changed lately**: see [`NEWS.md`](NEWS.md) — operator-readable highlights, most recent first.
+
+---
+
+## Why Portal
+
+| | |
+|---|---|
+| 🧩 **Tiny core, everything else is a module** | ~34,700 lines of C across 91 source files; 52 hot-loadable modules; the core does almost nothing by itself |
+| 🛣️ **One namespace** | Every resource is a path. `get /<module>/resources/<name>` works the same from CLI, HTTP, HTTPS, TCP, UDP, federation peer, or remote `/api` |
+| 🔐 **Label intersection ACL** | Every authenticated identity carries labels; every path and every emittable row carries labels; the core drops what doesn't intersect — unconditionally, in one place |
+| 🌐 **Asymmetric federation** | TLS-PORTAL02 mesh, per-connection identity exchange (Phase 5 always-on), per-peer outbound keys; one compromised peer can't impersonate another |
+| 🔥 **Crash isolation** | A module SIGSEGV is caught by `setjmp/longjmp` in the dispatcher — the core survives and the request returns `500 Module crashed` |
+| 🧠 **Modules in 5 languages** | C, Lua, Python, Pascal, plus a logic VM — same module ABI |
+| 🗃️ **Three storage backends** | File, SQLite, PostgreSQL — same `core->storage` interface, configured per-instance |
+| 📡 **6 simultaneous interfaces** | CLI, HTTP, HTTPS, TCP, UDP, SSH — same paths, same ACL, same data |
+| 🪝 **Outbound webhooks (HTTPS)** | `mod_webhook` POSTs any registered event to any URL (TLS 1.2, SNI, system CA verify). One curl call connects Portal events to make.com / Slack / Zapier / PagerDuty. |
 
 ---
 
@@ -26,6 +48,7 @@
 - [Quick Start](#quick-start)
 - [What is Portal?](#what-is-portal)
 - [Interfaces](#interfaces)
+- [Security in 60 seconds](#security-in-60-seconds)
 - [HTTP REST API](#http-rest-api)
 - [CLI Reference](#cli-reference)
 - [Authentication](#authentication)
@@ -109,6 +132,47 @@ Portal exposes its path system through 6 simultaneous interfaces. All share the 
 | **Node TCP** | Wire protocol | 9701 | Federation between Portal instances |
 
 All ports are configurable per instance. Set to 0 to disable.
+
+---
+
+## Security in 60 seconds
+
+Portal's security model is the same across CLI, HTTP, federation, and SSH — there is no second perimeter to secure separately. Three primitives compose the whole stack; the canonical reference is [`docs/SECURITY.md`](docs/SECURITY.md).
+
+| Primitive | What it gates | Where it lives |
+|---|---|---|
+| **Identity** (Law 9) | Who is calling | `core_auth.c` (local users), `mod_node` `identity_proof` (federation peers) |
+| **Path ACL** (Law 8) | Whether they can call this path at all | `portal_path_check_access` — label intersection between caller and path |
+| **Output filter** (Law 15) | Which rows they may see in the response | `portal_labels_allow` — label intersection between caller and each emitted row |
+
+### Federation identity (always-on, Phase 5)
+
+Two peers complete the PORTAL02 TLS handshake (mesh membership, gated by the shared `federation_key`), then exchange API keys via `/node/functions/identity_proof`. Each side resolves the other's claimed key against its **local** Portal user registry. Every subsequent inbound message from that peer is dispatched as the resolved local user — or **anonymous** if no key matched. There is no "promote federated calls to local root" fallback.
+
+```
+mod_node.conf
+    federation_key  = <shared mesh secret>
+    peer_keys       = peer-name:<api_key of a local user on peer>, ...
+    peer_default_key = <fallback for unlisted peers; leave empty in multi-tenant>
+    federation_inbound_default_user = <opt-in, single-peer devices only>
+```
+
+### Mutation gate (Phase 3)
+
+Mutating endpoints — `/users/`, `/groups/`, `/core/modules/`, `/core/config/set` — require the caller to be Portal user `root` **or** carry the `hub-admin` label. Reads stay open at module-handler scope. Implemented in `core_handlers.c:caller_is_admin()`.
+
+### Asymmetric SSIP shell (defense in depth)
+
+For the SSIP fleet specifically, two independent gates enforce "operator-on-hub can shell into any device, no device can shell into the hub":
+1. **Identity gate** — devices arrive on the hub as low-priv `dev-root-<N>` (no `root` label); the hub's `/shell/functions/dialback_request` denies them. The hub arrives on each device as the privileged local `hub` user (`root, admin, hub-admin`); device-side dial-back accepts.
+2. **Listener gate** — `mod_shell.conf` `shell_disable_direct_target = true` on the hub makes its `:2223` dial-back listener reject incoming `DIRECT` lines, closing the TLS-only `/bin/su` bypass.
+
+Either gate alone would be sufficient; both together is the policy.
+
+### Per-module operator companions
+
+- [`mod_ssip_hub/docs/security.md`](../mod_ssip_hub/docs/security.md) — hub-side knobs and runbooks
+- [`mod_ssip/docs/security.md`](../mod_ssip/docs/security.md) — device-side knobs and runbooks
 
 ---
 
@@ -233,9 +297,20 @@ Connect with `portal -n devtest -r` or `portalctl -s /var/run/portal-devtest.soc
 | Command | Description |
 |---------|-------------|
 | `ls [path]` | List children (shows users, groups, modules, remote nodes) |
-| `cd <path>` | Change current path |
+| `cd <path>` | Change current path. Rejects paths that don't exist (exact match or prefix of any registered path) with `No such path`, mirroring a real filesystem's `cd` behaviour. Works locally and across federation — `cd /remote-node/some-module` is valid because the `/remote-node/*` wildcard is registered locally as a direct-peer handler. |
 | `pwd` | Print current path |
-| `get <path>` | Send GET to any path and display response |
+| `get <path>` | Send GET to any path and display response. Paths resolve against cwd — `get foo/bar` from `/remote-node` sends `/remote-node/foo/bar` over federation, recursively stripping on each relay. |
+
+**TAB completion** works for `cd`, `ls`, `get` with both absolute and
+relative operands. Single TAB inserts the common prefix (and trailing
+`/` for navigable sub-paths); second TAB lists candidates. Federated
+completion is live: `cd /remote-node/g<TAB>` queries the remote's
+`/core/ls` and completes against the response.
+
+**Module shortcuts are cwd-aware.** `sysinfo`, `uptime`, `health`,
+`metrics` resolve against the current directory — run `sysinfo` inside
+`/remote-node/peer` and you get *that peer's* sysinfo, not the
+operator's local machine.
 
 ### System
 
@@ -368,31 +443,33 @@ Connect with `portal -n devtest -r` or `portalctl -s /var/run/portal-devtest.soc
 
 ## Authentication
 
+> **Canonical reference**: [`docs/SECURITY.md`](docs/SECURITY.md) — full security model, every knob, operator runbooks, threat model. The summary below is a quick orientation only.
+
 ### Three Methods
 
-1. **Username + Password** — Login via CLI or HTTP Basic Auth. Passwords stored as SHA-256 hashes or plain text (backwards compatible).
-
-2. **API Keys** — 64-character hex strings. Alternative to passwords for automated access. Generated per user, rotatable.
-
-3. **Session Tokens** — Returned after login. 32-character hex, TTL 1 hour (configurable). Auto-cleaned by timer.
+1. **Username + Password** — Login via CLI or HTTP. Passwords stored as `$sha256$salt$hash` or plain text (backwards compatible).
+2. **API Keys** — 64-character hex per user; rotatable. Carried as `X-API-Key` header (HTTP) or `ctx->auth.token` (federation).
+3. **Session Tokens** — Returned by `/auth/login`. 64-char hex, TTL 1 hour (configurable per registry).
 
 ### Label-Based Access Control
 
-- Users have **groups** (labels): `admin`, `dev`, `finance`
-- Paths have **labels**: set by modules via `core->path_add_label()`
-- **Access rule**: `intersection(user.groups, path.labels) != empty` → ALLOW
-- Path with **no labels** → open to everyone (public)
-- **root** user → always allowed (bypasses all checks)
-- ACL enforced identically across CLI, HTTP, TCP, UDP — all interfaces
+- Users have **labels** (a.k.a. groups): `admin`, `hub-admin`, `ssip5`, etc.
+- Paths have **labels**: set by modules via `core->path_add_label()`.
+- **Law 8 (path ACL)**: `intersection(user.labels, path.labels) != empty` → ALLOW. Path with no labels → open. User `root` always allowed.
+- **Law 15 (output filter)**: same predicate applied per-row inside listing handlers. `sys.see_all` is the one audited bypass.
+- **Phase 3 mutation gate**: `/users/`, `/groups/`, `/core/modules/`, `/core/config/set` all require `root` or `hub-admin`.
+- **Federation identity (always-on, Phase 5)**: peers exchange API keys at handshake; subsequent inbound is dispatched as the resolved local user (or anonymous).
+- ACL enforced identically across CLI, HTTP, federation, SSH.
 
 ### Users File
 
 ```ini
-# /etc/portal/devtest/users/admin.conf
-password = $sha256$salt$hash
-api_key = a1b2c3d4...
-groups = admin,dev
+# /etc/portal/devtest/users.conf — seeds initial users
+# Format: username:password:label1,label2:api_key
+maria:s3cret:ssip5,hub-operator:auto
 ```
+
+After first start, runtime mutations go via `/users/<name>` SET (admin-only) or `core->auth_ensure_user()` (modules).
 
 ---
 

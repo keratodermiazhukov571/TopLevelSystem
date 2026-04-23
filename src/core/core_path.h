@@ -87,6 +87,32 @@ const portal_labels_t *portal_path_get_labels(portal_path_tree_t *tree,
 int  portal_path_check_access(portal_path_tree_t *tree, const char *path,
                                const portal_ctx_t *ctx);
 
+/*
+ * Law 15 — group-scoped output filter predicate.
+ *
+ * Decide whether a row bearing row_labels should be visible to ctx.
+ * This is the companion to portal_path_check_access: that one gates
+ * "can you call this path?", this one filters "which rows do you see?".
+ *
+ * Rules applied in order (short-circuit on first match):
+ *   1. ctx is NULL                                → allowed (internal call).
+ *   2. ctx->auth.user == "root"                   → allowed.
+ *   3. ctx->auth.labels has "sys.see_all"         → allowed, and *bypass
+ *                                                   is set to 1 so the caller
+ *                                                   can emit an audit event.
+ *   4. row_labels is NULL or row_labels->count==0 → allowed (public row).
+ *   5. otherwise                                   → intersection check.
+ *
+ * The `bypass` output is optional (may be NULL). It exists so the core
+ * API wrapper can emit /events/acl/bypass without requiring this pure
+ * predicate to depend on the event registry.
+ *
+ * Returns 1 if allowed, 0 if denied.
+ */
+int  portal_labels_allow(const portal_ctx_t *ctx,
+                          const portal_labels_t *row_labels,
+                          int *bypass);
+
 /* List all registered paths. Calls callback for each. */
 typedef void (*portal_path_list_fn)(const char *path, const char *module_name,
                                      void *userdata);

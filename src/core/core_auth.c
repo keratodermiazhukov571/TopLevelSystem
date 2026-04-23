@@ -28,31 +28,37 @@
 #include <string.h>
 #include <time.h>
 #include <ctype.h>
+#include <sys/random.h>
 #include "core_auth.h"
 #include "core_log.h"
 #include "portal/constants.h"
 #include "sha256.h"
 #include "core_store.h"
 
-/* --- Token generation --- */
-
+/* --- Token generation ---
+ *
+ * 2 hex chars per random byte (full 8 bits of entropy each) using
+ * getrandom(2). Fails closed — if the kernel CSPRNG is unavailable
+ * we abort instead of falling back to rand()/time(), which is a
+ * known-predictable seed and would leak session tokens and api_keys
+ * to anyone who knows the boot time. */
 static void generate_token(char *buf, size_t len)
 {
     static const char hex[] = "0123456789abcdef";
-    FILE *f = fopen("/dev/urandom", "rb");
-    if (f) {
-        for (size_t i = 0; i < len; i++) {
-            unsigned char c;
-            if (fread(&c, 1, 1, f) == 1)
-                buf[i] = hex[c % 16];
-            else
-                buf[i] = hex[(unsigned)rand() % 16];
-        }
-        fclose(f);
-    } else {
-        srand((unsigned)time(NULL));
-        for (size_t i = 0; i < len; i++)
-            buf[i] = hex[(unsigned)rand() % 16];
+    /* Read ceil(len/2) random bytes, hex-encode to fill len chars. */
+    unsigned char raw[64];          /* AUTH_TOKEN_LEN/AUTH_KEY_LEN both ≤ 128 */
+    size_t need = (len + 1) / 2;
+    if (need > sizeof(raw)) need = sizeof(raw);
+    ssize_t got = getrandom(raw, need, 0);
+    if (got != (ssize_t)need) {
+        /* Fail closed — no usable CSPRNG. Leave buf empty so any
+         * subsequent strcmp-based check refuses the value. */
+        if (len > 0) buf[0] = '\0';
+        return;
+    }
+    for (size_t i = 0; i < len; i++) {
+        unsigned char b = raw[i / 2];
+        buf[i] = hex[(i & 1) ? (b & 0xf) : (b >> 4)];
     }
     buf[len] = '\0';
 }
@@ -105,11 +111,29 @@ void portal_auth_init(portal_auth_registry_t *auth)
     memset(auth, 0, sizeof(*auth));
     auth->session_ttl = AUTH_SESSION_TTL;
 
+    /* Seed root with an unreachable random password so that if the
+     * store load fails (missing users/root.conf, corrupt DB, race) we
+     * do NOT end up with a registry where `login root ""` succeeds.
+     * The normal flow (portal_auth_load_from_store) overwrites this
+     * with the operator-set password from persistent storage before
+     * any listener is up. */
+    char unreachable_pw[AUTH_KEY_LEN + 1];
+    generate_token(unreachable_pw, AUTH_KEY_LEN);
+    if (unreachable_pw[0] == '\0') {
+        /* getrandom failed — fail closed. A registry with no root is
+         * safer than one with a guessable/empty pw. Caller's load
+         * step is responsible for populating users. */
+        LOG_WARN("auth", "CSPRNG unavailable — root seed skipped; "
+                          "users/root.conf load must succeed");
+        return;
+    }
     portal_labels_t root_labels = {0};
     portal_labels_add(&root_labels, "root");
-    portal_auth_add_user(auth, "root", "", &root_labels);
+    portal_auth_add_user(auth, "root", unreachable_pw, &root_labels);
 
-    LOG_DEBUG("auth", "Auth registry initialized (root user created)");
+    LOG_DEBUG("auth", "Auth registry initialized "
+                       "(root seeded with unreachable password; "
+                       "store load will overwrite)");
 }
 
 void portal_auth_destroy(portal_auth_registry_t *auth)
@@ -311,6 +335,18 @@ const char *portal_auth_login_key(portal_auth_registry_t *auth,
 
     LOG_INFO("auth", "User '%s' logged in via API key", user->username);
     return session->token;
+}
+
+auth_user_t *portal_auth_find_by_key(portal_auth_registry_t *auth,
+                                      const char *api_key)
+{
+    if (!auth || !api_key || api_key[0] == '\0') return NULL;
+    for (int i = 0; i < auth->user_count; i++) {
+        if (auth->users[i].api_key[0] != '\0' &&
+            strcmp(auth->users[i].api_key, api_key) == 0)
+            return &auth->users[i];
+    }
+    return NULL;
 }
 
 int portal_auth_rotate_key(portal_auth_registry_t *auth, const char *username)
@@ -517,11 +553,15 @@ int portal_auth_save_user_to_store(portal_auth_registry_t *auth,
     if (user->api_key[0])
         portal_ht_set(&kv, "api_key", strdup(user->api_key));
 
-    /* Build groups string from labels */
-    char groups[1024] = {0};
-    for (int i = 0; i < user->labels.count; i++) {
-        if (i > 0) strcat(groups, ",");
-        strcat(groups, user->labels.labels[i]);
+    /* Build groups string from labels (bounded; 32*64 = 2048 possible
+     * input bytes must fit in a buffer we control). */
+    char groups[PORTAL_MAX_LABELS * (PORTAL_MAX_LABEL_LEN + 2)] = {0};
+    size_t goff = 0;
+    for (int i = 0; i < user->labels.count && goff < sizeof(groups) - 1; i++) {
+        int gn = snprintf(groups + goff, sizeof(groups) - goff,
+                          "%s%s", i > 0 ? "," : "", user->labels.labels[i]);
+        if (gn < 0 || (size_t)gn >= sizeof(groups) - goff) break;
+        goff += (size_t)gn;
     }
     portal_ht_set(&kv, "groups", strdup(groups));
 

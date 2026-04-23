@@ -38,6 +38,11 @@
 #include <pthread.h>
 #include "portal/portal.h"
 
+#ifdef HAS_SSL
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#endif
+
 #define WH_MAX_HOOKS   64
 #define WH_TIMEOUT     5
 #define WH_RETRY       3
@@ -48,6 +53,7 @@ typedef struct {
     char    url[512];
     char    host[256];
     int     port;
+    int     tls;        /* 1 = https://, 0 = http:// */
     char    path[256];
     char    event[PORTAL_MAX_PATH_LEN];  /* subscribe to this event */
     int     active;
@@ -62,9 +68,14 @@ static int            g_max = WH_MAX_HOOKS;
 static int            g_timeout = WH_TIMEOUT;
 static int            g_retry = WH_RETRY;
 
+#ifdef HAS_SSL
+static SSL_CTX       *g_ssl_ctx = NULL;
+static int            g_tls_verify = 1;   /* set to 0 to allow self-signed */
+#endif
+
 static portal_module_info_t info = {
     .name = "webhook", .version = "1.0.0",
-    .description = "Webhook dispatcher (HTTP POST)",
+    .description = "Webhook dispatcher (HTTP/HTTPS POST)",
     .soft_deps = NULL
 };
 portal_module_info_t *portal_module_info(void) { return &info; }
@@ -85,11 +96,20 @@ static webhook_t *find_hook(const char *name)
 }
 
 static int parse_url(const char *url, char *host, size_t hlen,
-                     int *port, char *path, size_t plen)
+                     int *port, char *path, size_t plen, int *tls)
 {
     const char *p = url;
-    if (strncmp(p, "http://", 7) == 0) p += 7;
-    else if (strncmp(p, "https://", 8) == 0) p += 8;
+    int default_port = 80;
+    if (tls) *tls = 0;
+    if (strncmp(p, "http://", 7) == 0) {
+        p += 7;
+        default_port = 80;
+        if (tls) *tls = 0;
+    } else if (strncmp(p, "https://", 8) == 0) {
+        p += 8;
+        default_port = 443;
+        if (tls) *tls = 1;
+    }
 
     const char *colon = strchr(p, ':');
     const char *slash = strchr(p, '/');
@@ -103,17 +123,24 @@ static int parse_url(const char *url, char *host, size_t hlen,
         size_t hl = (size_t)(slash - p);
         if (hl >= hlen) hl = hlen - 1;
         memcpy(host, p, hl); host[hl] = '\0';
-        *port = 80;
+        *port = default_port;
     } else {
         snprintf(host, hlen, "%s", p);
-        *port = 80;
+        *port = default_port;
     }
     if (slash) snprintf(path, plen, "%s", slash);
     else snprintf(path, plen, "/");
     return 0;
 }
 
-/* Send HTTP POST to webhook URL */
+/* Send HTTP[S] POST to webhook URL.
+ *
+ * For HTTPS, wraps the connected socket in OpenSSL using the shared
+ * g_ssl_ctx (created at module load when HAS_SSL is built in).
+ * Cert verification is gated by g_tls_verify (default on); operators
+ * with self-signed receivers can flip tls_verify=false in
+ * mod_webhook.conf. SNI is set so make.com/Cloudflare-style
+ * multi-tenant endpoints route correctly. */
 static int webhook_post(webhook_t *hook, const char *body, size_t body_len)
 {
     struct hostent *he = gethostbyname(hook->host);
@@ -136,6 +163,42 @@ static int webhook_post(webhook_t *hook, const char *body, size_t body_len)
         return -1;
     }
 
+#ifdef HAS_SSL
+    SSL *ssl = NULL;
+    if (hook->tls) {
+        if (!g_ssl_ctx) {
+            close(fd);
+            return -1;
+        }
+        ssl = SSL_new(g_ssl_ctx);
+        if (!ssl) { close(fd); return -1; }
+        SSL_set_fd(ssl, fd);
+        /* SNI — required by virtually every TLS terminator on the public
+         * web (Cloudflare, AWS ALB, make.com hooks, etc.). */
+        SSL_set_tlsext_host_name(ssl, hook->host);
+        if (g_tls_verify) {
+            /* Set the expected server name for hostname verification. */
+            X509_VERIFY_PARAM *vp = SSL_get0_param(ssl);
+            X509_VERIFY_PARAM_set_hostflags(vp, 0);
+            X509_VERIFY_PARAM_set1_host(vp, hook->host, 0);
+            SSL_set_verify(ssl, SSL_VERIFY_PEER, NULL);
+        } else {
+            SSL_set_verify(ssl, SSL_VERIFY_NONE, NULL);
+        }
+        if (SSL_connect(ssl) <= 0) {
+            SSL_free(ssl);
+            close(fd);
+            return -1;
+        }
+    }
+#else
+    if (hook->tls) {
+        /* TLS requested but compiled without OpenSSL. */
+        close(fd);
+        return -1;
+    }
+#endif
+
     char req[WH_BUF_SIZE];
     int rlen = snprintf(req, sizeof(req),
         "POST %s HTTP/1.0\r\n"
@@ -147,13 +210,30 @@ static int webhook_post(webhook_t *hook, const char *body, size_t body_len)
         "\r\n",
         hook->path, hook->host, body_len);
 
-    if (write(fd, req, (size_t)rlen) < 0) { close(fd); return -1; }
-    if (body_len > 0 && write(fd, body, body_len) < 0) { close(fd); return -1; }
-
-    /* Read response status */
+    int wrc = -1;
     char resp[512];
-    ssize_t rd = read(fd, resp, sizeof(resp) - 1);
+    ssize_t rd = -1;
+
+#ifdef HAS_SSL
+    if (ssl) {
+        if (SSL_write(ssl, req, rlen) <= 0) goto bail_ssl;
+        if (body_len > 0 && SSL_write(ssl, body, (int)body_len) <= 0) goto bail_ssl;
+        rd = SSL_read(ssl, resp, sizeof(resp) - 1);
+        wrc = 0;
+    bail_ssl:
+        SSL_shutdown(ssl);
+        SSL_free(ssl);
+    } else
+#endif
+    {
+        if (write(fd, req, (size_t)rlen) < 0) { close(fd); return -1; }
+        if (body_len > 0 && write(fd, body, body_len) < 0) { close(fd); return -1; }
+        rd = read(fd, resp, sizeof(resp) - 1);
+        wrc = 0;
+    }
+
     close(fd);
+    if (wrc != 0) return -1;
 
     if (rd > 0) {
         resp[rd] = '\0';
@@ -231,6 +311,32 @@ int portal_module_load(portal_core_t *core)
     if ((v = core->config_get(core, "webhook", "retry")))
         g_retry = atoi(v);
 
+#ifdef HAS_SSL
+    /* tls_verify defaults to true; flip to false in mod_webhook.conf for
+     * receivers behind self-signed certs. Never flip it for make.com /
+     * Slack / public webhook receivers — those must be verified. */
+    if ((v = core->config_get(core, "webhook", "tls_verify"))) {
+        g_tls_verify = (atoi(v) != 0 ||
+                        strcasecmp(v, "true") == 0 ||
+                        strcasecmp(v, "yes") == 0) ? 1 : 0;
+    }
+    SSL_library_init();
+    SSL_load_error_strings();
+    g_ssl_ctx = SSL_CTX_new(TLS_client_method());
+    if (g_ssl_ctx) {
+        /* Use system trust store; on AlmaLinux/RHEL/Debian this loads
+         * /etc/pki or /etc/ssl/certs automatically. */
+        SSL_CTX_set_default_verify_paths(g_ssl_ctx);
+        SSL_CTX_set_min_proto_version(g_ssl_ctx, TLS1_2_VERSION);
+        core->log(core, PORTAL_LOG_INFO, "webhook",
+                  "TLS client ctx ready (verify: %s)",
+                  g_tls_verify ? "on" : "off");
+    } else {
+        core->log(core, PORTAL_LOG_WARN, "webhook",
+                  "Failed to initialize TLS client ctx — https:// hooks will be rejected");
+    }
+#endif
+
     core->path_register(core, "/webhook/resources/status", "webhook");
     core->path_set_access(core, "/webhook/resources/status", PORTAL_ACCESS_READ);
     core->path_set_description(core, "/webhook/resources/status", "Webhook dispatcher: hook count, timeout, retries");
@@ -239,12 +345,16 @@ int portal_module_load(portal_core_t *core)
     core->path_set_description(core, "/webhook/resources/hooks", "List registered webhooks");
     core->path_register(core, "/webhook/functions/register", "webhook");
     core->path_set_access(core, "/webhook/functions/register", PORTAL_ACCESS_RW);
+    core->path_add_label(core, "/webhook/functions/register", "hub-admin");
     core->path_register(core, "/webhook/functions/unregister", "webhook");
     core->path_set_access(core, "/webhook/functions/unregister", PORTAL_ACCESS_RW);
+    core->path_add_label(core, "/webhook/functions/unregister", "hub-admin");
     core->path_register(core, "/webhook/functions/send", "webhook");
     core->path_set_access(core, "/webhook/functions/send", PORTAL_ACCESS_RW);
+    core->path_add_label(core, "/webhook/functions/send", "hub-admin");
     core->path_register(core, "/webhook/functions/test", "webhook");
     core->path_set_access(core, "/webhook/functions/test", PORTAL_ACCESS_RW);
+    core->path_add_label(core, "/webhook/functions/test", "hub-admin");
 
     /* Subscribe to all events */
     core->subscribe(core, "/events/*", webhook_event_handler, NULL);
@@ -265,6 +375,9 @@ int portal_module_unload(portal_core_t *core)
     core->path_unregister(core, "/webhook/functions/unregister");
     core->path_unregister(core, "/webhook/functions/send");
     core->path_unregister(core, "/webhook/functions/test");
+#ifdef HAS_SSL
+    if (g_ssl_ctx) { SSL_CTX_free(g_ssl_ctx); g_ssl_ctx = NULL; }
+#endif
     core->log(core, PORTAL_LOG_INFO, "webhook", "Webhook dispatcher unloaded");
     g_core = NULL;
     return PORTAL_MODULE_OK;
@@ -343,7 +456,17 @@ int portal_module_handle(portal_core_t *core, const portal_msg_t *msg,
         snprintf(h->name, sizeof(h->name), "%s", name);
         snprintf(h->url, sizeof(h->url), "%s", url);
         parse_url(url, h->host, sizeof(h->host),
-                  &h->port, h->path, sizeof(h->path));
+                  &h->port, h->path, sizeof(h->path), &h->tls);
+#ifndef HAS_SSL
+        if (h->tls) {
+            g_count--;   /* roll back the slot reservation */
+            portal_resp_set_status(resp, PORTAL_BAD_REQUEST);
+            n = snprintf(buf, sizeof(buf),
+                "https:// URLs require Portal built with HAS_SSL=yes\n");
+            portal_resp_set_body(resp, buf, (size_t)n);
+            return -1;
+        }
+#endif
         if (event) snprintf(h->event, sizeof(h->event), "%s", event);
         else h->event[0] = '\0';
         h->active = 1;
@@ -351,11 +474,13 @@ int portal_module_handle(portal_core_t *core, const portal_msg_t *msg,
 
         core->event_emit(core, "/events/webhook/register", name, strlen(name));
         portal_resp_set_status(resp, PORTAL_CREATED);
-        n = snprintf(buf, sizeof(buf), "Hook '%s' registered → %s:%d%s%s%s\n",
-                     name, h->host, h->port, h->path,
+        n = snprintf(buf, sizeof(buf), "Hook '%s' registered → %s://%s:%d%s%s%s",
+                     name, h->tls ? "https" : "http",
+                     h->host, h->port, h->path,
                      event ? " (event: " : "",
                      event ? event : "");
         if (event) n += snprintf(buf + n, sizeof(buf) - (size_t)n, ")\n");
+        else        n += snprintf(buf + n, sizeof(buf) - (size_t)n, "\n");
         portal_resp_set_body(resp, buf, (size_t)n);
         return 0;
     }

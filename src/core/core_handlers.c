@@ -151,23 +151,32 @@ static int handle_module_action(portal_instance_t *inst, const char *mod_name,
 /* --- /core/paths --- */
 
 typedef struct {
-    strbuf_t *sb;
+    strbuf_t            *sb;
+    portal_path_tree_t  *tree;
+    const portal_ctx_t  *caller;
 } path_list_ctx_t;
 
 static void path_list_cb(const char *path, const char *module_name, void *userdata)
 {
     path_list_ctx_t *ctx = userdata;
+
+    /* Law 15 — same filter as ls. Pure predicate, no audit event per row. */
+    path_entry_t *entry = portal_path_lookup_entry(ctx->tree, path);
+    if (entry && !portal_labels_allow(ctx->caller, &entry->labels, NULL))
+        return;
+
     strbuf_append(ctx->sb, "  %-40s → %s\n", path, module_name);
 }
 
-static int handle_paths_list(portal_instance_t *inst, portal_resp_t *resp)
+static int handle_paths_list(portal_instance_t *inst, const portal_msg_t *msg,
+                              portal_resp_t *resp)
 {
     char buf[65536];
     strbuf_t sb = { .buf = buf, .len = 0, .cap = sizeof(buf) };
 
     strbuf_append(&sb, "Registered paths:\n");
 
-    path_list_ctx_t ctx = { .sb = &sb };
+    path_list_ctx_t ctx = { .sb = &sb, .tree = &inst->paths, .caller = msg->ctx };
     portal_path_list(&inst->paths, path_list_cb, &ctx);
 
     portal_resp_set_status(resp, PORTAL_OK);
@@ -180,12 +189,14 @@ static int handle_paths_list(portal_instance_t *inst, portal_resp_t *resp)
 #define LS_MAX_ENTRIES 128
 
 typedef struct {
-    const char *prefix;
-    size_t      prefix_len;
-    char        children[LS_MAX_ENTRIES][128];   /* unique child segment names */
-    char        modules[LS_MAX_ENTRIES][PORTAL_MAX_MODULE_NAME];
-    int         is_leaf[LS_MAX_ENTRIES];          /* 1 = registered path, 0 = intermediate */
-    int         count;
+    const char          *prefix;
+    size_t               prefix_len;
+    portal_path_tree_t  *tree;       /* for re-lookup of entry labels */
+    const portal_ctx_t  *caller;     /* for Law 15 filter */
+    char                 children[LS_MAX_ENTRIES][128];   /* unique child segment names */
+    char                 modules[LS_MAX_ENTRIES][PORTAL_MAX_MODULE_NAME];
+    int                  is_leaf[LS_MAX_ENTRIES];          /* 1 = registered path, 0 = intermediate */
+    int                  count;
 } ls_ctx_t;
 
 static void ls_cb(const char *path, const char *module_name, void *userdata)
@@ -195,6 +206,14 @@ static void ls_cb(const char *path, const char *module_name, void *userdata)
 
     /* Must start with prefix */
     if (plen > 0 && strncmp(path, ctx->prefix, plen) != 0)
+        return;
+
+    /* Law 15 — hide paths the caller cannot access. Enumeration uses the
+     * pure predicate (no audit event): ls is navigation, not row consumption.
+     * Paths with no labels remain public; the gate lives in portal_path_check_access
+     * when the caller actually hits the path. */
+    path_entry_t *entry = portal_path_lookup_entry(ctx->tree, path);
+    if (entry && !portal_labels_allow(ctx->caller, &entry->labels, NULL))
         return;
 
     /* Get the part after the prefix */
@@ -275,6 +294,8 @@ static int handle_ls(portal_instance_t *inst, const portal_msg_t *msg,
     memset(&ctx, 0, sizeof(ctx));
     ctx.prefix = clean_prefix;
     ctx.prefix_len = cplen;
+    ctx.tree = &inst->paths;
+    ctx.caller = msg->ctx;
 
     portal_path_list(&inst->paths, ls_cb, &ctx);
 
@@ -320,9 +341,38 @@ static int handle_ls(portal_instance_t *inst, const portal_msg_t *msg,
     return 0;
 }
 
-/* --- /core/resolve (normalize path: cwd + relative → absolute) --- */
+/* --- /core/resolve (normalize path: cwd + relative → absolute) ---
+ *
+ * Besides string normalization, the resolver validates that the resolved
+ * path exists — either as an exact registered path or as the prefix of one.
+ * This stops `cd` from silently accepting typos (`cd gate` when only
+ * `gateway` is registered) which used to change the prompt to a fictitious
+ * location where subsequent commands returned (empty)/(unavailable) with
+ * no clue the cwd itself was bogus. */
 
-static int handle_resolve(const portal_msg_t *msg, portal_resp_t *resp)
+typedef struct {
+    const char *prefix;
+    size_t      prefix_len;
+    int         matched;
+} resolve_prefix_ctx_t;
+
+static void resolve_prefix_cb(const char *key, void *value, void *userdata)
+{
+    (void)value;
+    resolve_prefix_ctx_t *ctx = userdata;
+    if (ctx->matched) return;
+    /* Match if the registered path is equal to prefix OR starts with
+       prefix + "/" (so /ssip867 wildcard covers cwd=/ssip867,
+       /sysinfo/resources/os covers cwd=/sysinfo/resources, etc.). */
+    size_t klen = strlen(key);
+    if (klen < ctx->prefix_len) return;
+    if (strncmp(key, ctx->prefix, ctx->prefix_len) != 0) return;
+    if (klen == ctx->prefix_len || key[ctx->prefix_len] == '/')
+        ctx->matched = 1;
+}
+
+static int handle_resolve(portal_instance_t *inst,
+                          const portal_msg_t *msg, portal_resp_t *resp)
 {
     const char *cwd = "/";
     const char *target = "";
@@ -362,6 +412,27 @@ static int handle_resolve(const portal_msg_t *msg, portal_resp_t *resp)
     if (len > 1 && resolved[len - 1] == '/')
         resolved[len - 1] = '\0';
 
+    /* Existence check — root is always valid; otherwise the resolved path
+     * must either be a registered path or the prefix of one. */
+    if (strcmp(resolved, "/") != 0) {
+        int exists = 0;
+        if (portal_path_lookup(&inst->paths, resolved)) {
+            exists = 1;
+        } else {
+            resolve_prefix_ctx_t ctx = {
+                .prefix = resolved,
+                .prefix_len = strlen(resolved),
+                .matched = 0
+            };
+            portal_ht_iter(&inst->paths.table, resolve_prefix_cb, &ctx);
+            exists = ctx.matched;
+        }
+        if (!exists) {
+            portal_resp_set_status(resp, PORTAL_NOT_FOUND);
+            return -1;
+        }
+    }
+
     portal_resp_set_status(resp, PORTAL_OK);
     portal_resp_set_body(resp, resolved, strlen(resolved) + 1);
     return 0;
@@ -375,10 +446,13 @@ static void save_user_dual(portal_instance_t *inst, const char *username)
     portal_auth_save_user_to_store(&inst->auth, username, &inst->store);
     auth_user_t *u = portal_auth_find_user(&inst->auth, username);
     if (u) {
-        char groups[1024] = {0};
-        for (int j = 0; j < u->labels.count; j++) {
-            if (j > 0) strcat(groups, ",");
-            strcat(groups, u->labels.labels[j]);
+        char groups[PORTAL_MAX_LABELS * (PORTAL_MAX_LABEL_LEN + 2)] = {0};
+        size_t off = 0;
+        for (int j = 0; j < u->labels.count && off < sizeof(groups) - 1; j++) {
+            int n = snprintf(groups + off, sizeof(groups) - off,
+                             "%s%s", j > 0 ? "," : "", u->labels.labels[j]);
+            if (n < 0 || (size_t)n >= sizeof(groups) - off) break;
+            off += (size_t)n;
         }
         portal_storage_save_user(&inst->storage, u->username,
                                   u->password, u->api_key, groups);
@@ -392,6 +466,36 @@ static const char *get_header(const portal_msg_t *msg, const char *key)
             return msg->headers[i].value;
     }
     return NULL;
+}
+
+/* Phase 3 — mutation-endpoint gate.
+ *
+ * Core paths like `/users/<name>`, `/groups/<name>/add`, `/core/modules/`
+ * subpaths, `/core/config/set` etc. are dispatched to this handler via
+ * the prefix router at portal_instance.c:137-142. Those paths are NOT
+ * registered in the path tree with labels, so the label-based ACL check
+ * at :166 silently skips them (portal_path_lookup returns NULL for
+ * `/users/alice`, so the short-circuit `if (lookup && !check)` misses).
+ *
+ * Before strict federation identity, that was harmless: federation peers
+ * were promoted to local root anyway, and local callers came through
+ * mod_cli / mod_web with real auth. Under strict mode a low-priv
+ * carrier-bot user (dev-root-<N>) could otherwise reach these endpoints
+ * unchecked. This helper closes that gap explicitly:
+ *
+ *   - root user  → allowed (mirrors portal_path_check_access).
+ *   - hub-admin  → allowed (operator group).
+ *   - otherwise  → denied (caller writes 403 and returns).
+ */
+static int caller_is_admin(const portal_msg_t *msg)
+{
+    if (!msg || !msg->ctx) return 0;
+    if (msg->ctx->auth.user &&
+        strcmp(msg->ctx->auth.user, PORTAL_ROOT_USER) == 0)
+        return 1;
+    if (portal_labels_has(&msg->ctx->auth.labels, "hub-admin"))
+        return 1;
+    return 0;
 }
 
 /* --- /auth/logout --- */
@@ -606,7 +710,7 @@ int core_handle_message(portal_core_t *core, const portal_msg_t *msg,
     }
 
     if (strcmp(path, "/core/paths") == 0 && msg->method == PORTAL_METHOD_GET) {
-        return handle_paths_list(inst, resp);
+        return handle_paths_list(inst, msg, resp);
     }
 
     if (strcmp(path, "/core/ls") == 0) {
@@ -614,11 +718,15 @@ int core_handle_message(portal_core_t *core, const portal_msg_t *msg,
     }
 
     if (strcmp(path, "/core/resolve") == 0) {
-        return handle_resolve(msg, resp);
+        return handle_resolve(inst, msg, resp);
     }
 
     /* /core/modules/<name> with CALL method = load/unload */
     if (strncmp(path, "/core/modules/", 14) == 0 && msg->method == PORTAL_METHOD_CALL) {
+        if (!caller_is_admin(msg)) {
+            portal_resp_set_status(resp, PORTAL_FORBIDDEN);
+            return -1;
+        }
         const char *mod_name = path + 14;
         if (mod_name[0] != '\0')
             return handle_module_action(inst, mod_name, msg, resp);
@@ -727,8 +835,16 @@ int core_handle_message(portal_core_t *core, const portal_msg_t *msg,
             snprintf(name, sizeof(name), "%s", uname);
         }
 
-        /* /users/<name>/password CALL — change password */
+        /* /users/<name>/password CALL — change password.
+         * Admin always allowed. Non-admin allowed only to change their
+         * OWN password. Anonymous denied. */
         if (slash && strcmp(slash, "/password") == 0 && msg->method == PORTAL_METHOD_CALL) {
+            int is_self = (msg->ctx && msg->ctx->auth.user &&
+                           strcmp(msg->ctx->auth.user, name) == 0);
+            if (!caller_is_admin(msg) && !is_self) {
+                portal_resp_set_status(resp, PORTAL_FORBIDDEN);
+                return -1;
+            }
             const char *newpass = get_header(msg, "password");
             if (!newpass) {
                 portal_resp_set_status(resp, PORTAL_BAD_REQUEST);
@@ -760,6 +876,10 @@ int core_handle_message(portal_core_t *core, const portal_msg_t *msg,
         }
 
         if (msg->method == PORTAL_METHOD_SET) {
+            if (!caller_is_admin(msg)) {
+                portal_resp_set_status(resp, PORTAL_FORBIDDEN);
+                return -1;
+            }
             const char *password = get_header(msg, "password");
             if (!password) password = "";
             portal_labels_t labels = {0};
@@ -828,6 +948,10 @@ int core_handle_message(portal_core_t *core, const portal_msg_t *msg,
 
         /* /groups/<name>/add CALL — add user to group */
         if (action && strcmp(action, "add") == 0 && msg->method == PORTAL_METHOD_CALL) {
+            if (!caller_is_admin(msg)) {
+                portal_resp_set_status(resp, PORTAL_FORBIDDEN);
+                return -1;
+            }
             const char *uname = get_header(msg, "user");
             if (!uname) { portal_resp_set_status(resp, PORTAL_BAD_REQUEST); return -1; }
             auth_user_t *u = portal_auth_find_user(&inst->auth, uname);
@@ -843,6 +967,10 @@ int core_handle_message(portal_core_t *core, const portal_msg_t *msg,
 
         /* /groups/<name>/remove CALL — remove user from group */
         if (action && strcmp(action, "remove") == 0 && msg->method == PORTAL_METHOD_CALL) {
+            if (!caller_is_admin(msg)) {
+                portal_resp_set_status(resp, PORTAL_FORBIDDEN);
+                return -1;
+            }
             const char *uname = get_header(msg, "user");
             if (!uname) { portal_resp_set_status(resp, PORTAL_BAD_REQUEST); return -1; }
             auth_user_t *u = portal_auth_find_user(&inst->auth, uname);
@@ -858,6 +986,10 @@ int core_handle_message(portal_core_t *core, const portal_msg_t *msg,
 
         /* /groups/<name> SET — create group */
         if (!action && msg->method == PORTAL_METHOD_SET) {
+            if (!caller_is_admin(msg)) {
+                portal_resp_set_status(resp, PORTAL_FORBIDDEN);
+                return -1;
+            }
             const char *desc = get_header(msg, "description");
             const char *created_by = "cli";
             if (msg->ctx && msg->ctx->auth.user)
@@ -927,6 +1059,10 @@ int core_handle_message(portal_core_t *core, const portal_msg_t *msg,
 
     /* /core/config/set — write a config value to database + memory */
     if (strcmp(path, "/core/config/set") == 0) {
+        if (!caller_is_admin(msg)) {
+            portal_resp_set_status(resp, PORTAL_FORBIDDEN);
+            return -1;
+        }
         const char *mod = NULL, *key = NULL, *val = NULL;
         for (uint16_t i = 0; i < msg->header_count; i++) {
             if (strcmp(msg->headers[i].key, "module") == 0) mod = msg->headers[i].value;
@@ -1150,10 +1286,13 @@ int core_handle_message(portal_core_t *core, const portal_msg_t *msg,
                 int synced = 0;
                 for (int i = 0; i < inst->auth.user_count; i++) {
                     auth_user_t *u = &inst->auth.users[i];
-                    char groups[1024] = {0};
-                    for (int j = 0; j < u->labels.count; j++) {
-                        if (j > 0) strcat(groups, ",");
-                        strcat(groups, u->labels.labels[j]);
+                    char groups[PORTAL_MAX_LABELS * (PORTAL_MAX_LABEL_LEN + 2)] = {0};
+                    size_t off = 0;
+                    for (int j = 0; j < u->labels.count && off < sizeof(groups) - 1; j++) {
+                        int gn = snprintf(groups + off, sizeof(groups) - off,
+                                          "%s%s", j > 0 ? "," : "", u->labels.labels[j]);
+                        if (gn < 0 || (size_t)gn >= sizeof(groups) - off) break;
+                        off += (size_t)gn;
                     }
                     if (prov->user_save(prov->ctx, u->username,
                         u->password, u->api_key, groups) == 0)

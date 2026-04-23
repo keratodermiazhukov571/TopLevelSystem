@@ -165,6 +165,40 @@ int portal_path_check_access(portal_path_tree_t *tree, const char *path,
     return portal_labels_intersects(&entry->labels, &ctx->auth.labels);
 }
 
+int portal_labels_allow(const portal_ctx_t *ctx,
+                         const portal_labels_t *row_labels,
+                         int *bypass)
+{
+    if (bypass) *bypass = 0;
+
+    /* Internal call (no context) — always allowed. Core subsystems and
+     * module init paths build messages without a ctx; Law 15 is about
+     * scoping what a caller sees, not about blocking core itself. */
+    if (!ctx)
+        return 1;
+
+    /* Root bypasses everything. */
+    if (ctx->auth.user && strcmp(ctx->auth.user, PORTAL_ROOT_USER) == 0)
+        return 1;
+
+    /* Super-admin bypass — audited by the caller via /events/acl/bypass. */
+    if (portal_labels_has(&ctx->auth.labels, "sys.see_all")) {
+        if (bypass) *bypass = 1;
+        return 1;
+    }
+
+    /* Row has no labels = public. */
+    if (!row_labels || row_labels->count == 0)
+        return 1;
+
+    /* Caller with no labels against a labeled row = denied. */
+    if (ctx->auth.labels.count == 0)
+        return 0;
+
+    /* Intersection. */
+    return portal_labels_intersects(&ctx->auth.labels, row_labels);
+}
+
 /* --- Listing --- */
 
 typedef struct {

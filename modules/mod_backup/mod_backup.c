@@ -32,6 +32,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <dirent.h>
 #include <time.h>
 #include <pthread.h>
@@ -163,31 +164,67 @@ int portal_module_unload(portal_core_t *core)
     return PORTAL_MODULE_OK;
 }
 
+/* Run `tar` with argv array — no shell interpolation, no injection
+ * vector via headers. Captures up to `outcap` bytes of combined
+ * stdout+stderr for error reporting. Returns tar's exit code, or -1
+ * on fork/pipe failure. See docs/CODING.md rule #1. */
+static int run_tar(char *const argv[], char *out, size_t outcap)
+{
+    int pfd[2];
+    if (pipe(pfd) < 0) return -1;
+
+    pid_t pid = fork();
+    if (pid < 0) { close(pfd[0]); close(pfd[1]); return -1; }
+    if (pid == 0) {
+        close(pfd[0]);
+        dup2(pfd[1], STDOUT_FILENO);
+        dup2(pfd[1], STDERR_FILENO);
+        close(pfd[1]);
+        execvp("tar", argv);
+        _exit(127);
+    }
+    close(pfd[1]);
+    size_t off = 0;
+    if (out && outcap > 1) {
+        while (off < outcap - 1) {
+            ssize_t n = read(pfd[0], out + off, outcap - 1 - off);
+            if (n <= 0) break;
+            off += (size_t)n;
+        }
+        out[off] = '\0';
+    } else {
+        /* Caller doesn't want output — drain to avoid SIGPIPE in tar. */
+        char drop[4096];
+        while (read(pfd[0], drop, sizeof(drop)) > 0) { }
+    }
+    close(pfd[0]);
+    int status = 0;
+    waitpid(pid, &status, 0);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
 /* Background thread: create backup */
 static void *backup_create_thread(void *arg)
 {
     struct { char fpath[768]; char source[512]; char fname[256]; } *a = arg;
-    char cmd[2048];
-    snprintf(cmd, sizeof(cmd), "tar czf '%s' -C / '%s' 2>&1",
-             a->fpath, a->source[0] == '/' ? a->source + 1 : a->source);
-    FILE *fp = popen(cmd, "r");
-    if (fp) {
-        char out[1024] = "";
-        size_t rd = fread(out, 1, sizeof(out) - 1, fp);
-        out[rd] = '\0';
-        int status = pclose(fp);
-        if (WEXITSTATUS(status) == 0) {
-            g_created++;
-            if (g_core) {
-                g_core->event_emit(g_core, "/events/backup/create",
-                                   a->fname, strlen(a->fname));
-                g_core->log(g_core, PORTAL_LOG_INFO, "backup",
-                            "Created %s from %s", a->fname, a->source);
-            }
-        } else if (g_core) {
-            g_core->log(g_core, PORTAL_LOG_ERROR, "backup",
-                        "Backup failed: %s", out);
+    const char *rel_source =
+        a->source[0] == '/' ? a->source + 1 : a->source;
+    char *const argv[] = {
+        "tar", "czf", a->fpath, "-C", "/", (char *)rel_source, NULL
+    };
+    char out[1024] = "";
+    int rc = run_tar(argv, out, sizeof(out));
+    if (rc == 0) {
+        g_created++;
+        if (g_core) {
+            g_core->event_emit(g_core, "/events/backup/create",
+                               a->fname, strlen(a->fname));
+            g_core->log(g_core, PORTAL_LOG_INFO, "backup",
+                        "Created %s from %s", a->fname, a->source);
         }
+    } else if (g_core) {
+        g_core->log(g_core, PORTAL_LOG_ERROR, "backup",
+                    "Backup failed (rc=%d): %s", rc, out);
     }
     free(a);
     return NULL;
@@ -197,26 +234,22 @@ static void *backup_create_thread(void *arg)
 static void *backup_restore_thread(void *arg)
 {
     struct { char fpath[768]; char dest[512]; char name[256]; } *a = arg;
-    char cmd[2048];
-    snprintf(cmd, sizeof(cmd), "tar xzf '%s' -C '%s' 2>&1", a->fpath, a->dest);
-    FILE *fp = popen(cmd, "r");
-    if (fp) {
-        char out[1024] = "";
-        size_t rd = fread(out, 1, sizeof(out) - 1, fp);
-        out[rd] = '\0';
-        int status = pclose(fp);
-        if (WEXITSTATUS(status) == 0) {
-            g_restored++;
-            if (g_core) {
-                g_core->event_emit(g_core, "/events/backup/restore",
-                                   a->name, strlen(a->name));
-                g_core->log(g_core, PORTAL_LOG_INFO, "backup",
-                            "Restored %s to %s", a->name, a->dest);
-            }
-        } else if (g_core) {
-            g_core->log(g_core, PORTAL_LOG_ERROR, "backup",
-                        "Restore failed: %s", out);
+    char *const argv[] = {
+        "tar", "xzf", a->fpath, "-C", a->dest, NULL
+    };
+    char out[1024] = "";
+    int rc = run_tar(argv, out, sizeof(out));
+    if (rc == 0) {
+        g_restored++;
+        if (g_core) {
+            g_core->event_emit(g_core, "/events/backup/restore",
+                               a->name, strlen(a->name));
+            g_core->log(g_core, PORTAL_LOG_INFO, "backup",
+                        "Restored %s to %s", a->name, a->dest);
         }
+    } else if (g_core) {
+        g_core->log(g_core, PORTAL_LOG_ERROR, "backup",
+                    "Restore failed (rc=%d): %s", rc, out);
     }
     free(a);
     return NULL;

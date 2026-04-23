@@ -90,6 +90,14 @@ int  portal_auth_check_password(const char *stored, const char *input);
 const char *portal_auth_login_key(portal_auth_registry_t *auth,
                                    const char *api_key);
 
+/* Pure lookup by API key — finds the user record without creating a session.
+ * Used by the federation identity reconciler in mod_node, which needs to
+ * resolve a wire-supplied key to a local user without polluting the session
+ * table on every inbound message. Returns NULL on no match, empty key, or
+ * NULL key. A user with an empty stored api_key is never returned. */
+auth_user_t *portal_auth_find_by_key(portal_auth_registry_t *auth,
+                                      const char *api_key);
+
 /* Generate a new API key for a user. Returns 0 on success. */
 int  portal_auth_rotate_key(portal_auth_registry_t *auth, const char *username);
 

@@ -273,6 +273,8 @@ if (core->module_loaded(core, "db")) {
 
 ## Access Control
 
+> **Operator-facing reference**: [`docs/SECURITY.md`](SECURITY.md) covers the system-level model. This section is the module-author idiom only.
+
 Restrict paths with labels in `load()`:
 
 ```c
@@ -290,6 +292,48 @@ core->path_add_label(core, "/api/debug", "dev");
 ```
 
 The core enforces this automatically. Your handler only receives messages that passed the ACL check.
+
+### Filtering row output (Law 15)
+
+The labels above gate whether a caller can **call** the path. A different question is which of the **rows** your handler returns should actually be visible to this caller. That's Law 15.
+
+When your handler iterates and emits rows, call `core->labels_allow` per row with the row's own label set. Skip the row on a zero return. That's all.
+
+```c
+/* Worked example — what mod_node does for /node/resources/peers.
+ * See modules/mod_node/mod_node.c at the /node/resources/peers handler. */
+for (int i = 0; i < g_peer_count; i++) {
+    node_peer_t *p = g_peers[i];
+
+    portal_labels_t row_labels;
+    peer_get_labels(p, &row_labels);   /* your module fills this */
+
+    if (!core->labels_allow(core, msg->ctx, &row_labels))
+        continue;
+
+    /* … emit the row into the response buffer as you would anyway … */
+}
+```
+
+You do not register a callback with the core. You do not implement a new struct. You call the predicate inline, in the loop you were writing already. That's the whole API.
+
+For **detail lookups** (single row requested by name), return the same "not found" response the handler uses when the row truly doesn't exist — do not distinguish "hidden" from "absent" to the caller.
+
+One escape hatch exists for supervisors: a caller carrying the label `sys.see_all` bypasses the filter. Each bypass emits `/events/acl/bypass` so the audit trail stays complete. Module authors do not need to implement this — it's handled by the core wrapper that backs `labels_allow`.
+
+The default is permissive: a row with no labels is public. Adding labels to rows is how a module opts **into** scoping. See `docs/PHILOSOPHY.md` §Law 15 for the principle and `docs/CORE_API.md` §Group-Scoped Output for the full contract.
+
+### Cross-peer identity (Law 9 across federation)
+
+When `federation_strict_identity = true` is set on `mod_node`, federation peers exchange identity at handshake time and every inbound message is dispatched as the **resolved local user**, exactly as if the call came from a local CLI or HTTP session. Your handler reads `msg->ctx->auth.user` and `msg->ctx->auth.labels` the same way for both — it cannot tell, and shouldn't care, that the message came in over federation.
+
+Two things change for module authors:
+
+1. **`msg->ctx->source_node` is now populated** on federation-sourced messages — the name of the peer that sent the message. Always was declared, never was set; mod_node fills it in on every inbound dispatch. Use it when your handler needs to attribute an action to a specific peer (e.g. for audit logging or per-peer state). For local CLI/HTTP messages it stays NULL.
+
+2. **Anonymous calls from federation are real now.** When strict mode is on and a peer has no resolved identity (key didn't validate or no exchange ran), `msg->ctx->auth.user` is NULL. Don't assume there's always a username. The standard ACL gate already handles this — labeled paths deny anonymous, unlabeled paths still allow it.
+
+If you're writing a new module that needs to do its own key lookup (e.g. some other authenticated message exchange), use `core->auth_find_by_key(core, key, out_user, sizeof(out_user), &out_labels)` — returns 1 on match without creating a session. See `docs/CORE_API.md` §Federation identity exchange.
 
 ---
 

@@ -38,10 +38,12 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <libssh/libssh.h>
 #include <libssh/server.h>
 #include "portal/portal.h"
@@ -368,15 +370,38 @@ int portal_module_load(portal_core_t *core)
                      "/etc/portal/ssh_host_key");
     }
 
-    /* Generate key if missing */
+    /* Generate key if missing — fork+execvp with argv array, not a
+     * shell string, so any special chars in g_host_key (from config)
+     * can't inject commands. */
     if (access(g_host_key, F_OK) != 0) {
-        char cmd[2048];
-        snprintf(cmd, sizeof(cmd),
-                 "ssh-keygen -t rsa -b 2048 -f %s -N '' -q 2>/dev/null",
-                 g_host_key);
-        system(cmd);
-        core->log(core, PORTAL_LOG_INFO, "ssh",
-                  "Generated SSH host key: %s", g_host_key);
+        pid_t pid = fork();
+        if (pid == 0) {
+            /* Silence stdout/stderr to mirror the old "-q 2>/dev/null". */
+            int devnull = open("/dev/null", O_WRONLY);
+            if (devnull >= 0) {
+                dup2(devnull, STDOUT_FILENO);
+                dup2(devnull, STDERR_FILENO);
+                close(devnull);
+            }
+            char *const argv[] = {
+                "ssh-keygen", "-t", "rsa", "-b", "2048",
+                "-f", g_host_key, "-N", "", "-q", NULL
+            };
+            execvp("ssh-keygen", argv);
+            _exit(127);
+        } else if (pid > 0) {
+            int status = 0;
+            waitpid(pid, &status, 0);
+            if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
+                core->log(core, PORTAL_LOG_INFO, "ssh",
+                          "Generated SSH host key: %s", g_host_key);
+            else
+                core->log(core, PORTAL_LOG_WARN, "ssh",
+                          "ssh-keygen exited non-zero for %s", g_host_key);
+        } else {
+            core->log(core, PORTAL_LOG_ERROR, "ssh",
+                      "fork() failed while generating host key");
+        }
     }
 
     /* Create SSH bind */

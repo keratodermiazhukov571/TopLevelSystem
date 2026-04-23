@@ -427,6 +427,8 @@ Called when a message arrives at one of your registered paths. You must:
 
 ## 6. Access Control (Labels)
 
+> **Canonical reference**: [`docs/SECURITY.md`](SECURITY.md) covers the full model — identity, authorization, output filtering, federation identity, mutation gate, encryption, audit, operator runbooks. This section is the module-facing API contract only.
+
 Portal uses label-based access control. Simple, flexible, no role hierarchies.
 
 ### How It Works
@@ -464,6 +466,81 @@ int portal_module_load(portal_core_t *core)
 
 The core enforces access automatically on every `send()`. Your module does not need to check permissions — it only receives messages that have already passed the ACL.
 
+### Group-Scoped Output (Law 15)
+
+The ACL above is the **gate** — *can you call this path?* Law 15 is the **filter** — *of the rows this path returns, which ones do you see?*
+
+```c
+int (*labels_allow)(portal_core_t *core,
+                    const portal_ctx_t *ctx,
+                    const portal_labels_t *row_labels);
+```
+
+Returns `1` if a row bearing `row_labels` should be visible to `ctx`, `0` otherwise. Rules, applied in order:
+
+1. `ctx == NULL` → allowed (internal call, not a user request).
+2. `ctx->auth.user == "root"` → allowed.
+3. `ctx->auth.labels` contains `sys.see_all` → allowed, emits `/events/acl/bypass` with body `user=<name>`.
+4. `row_labels` is `NULL` or empty → allowed (public row).
+5. Otherwise → `portal_labels_intersects(&ctx->auth.labels, row_labels)`.
+
+Building blocks reused: `portal_labels_intersects` and `portal_labels_has` from `include/portal/types.h`.
+
+**Usage pattern** — a module that lists rows calls this per row and continues on 0:
+
+```c
+for (int i = 0; i < count; i++) {
+    portal_labels_t row_labels;
+    row_get_labels(&items[i], &row_labels);   /* module-specific */
+    if (!core->labels_allow(core, msg->ctx, &row_labels))
+        continue;
+    /* emit row into response */
+}
+```
+
+For detail lookups (single row by name), a denied filter returns the same "not found" response used when the row truly doesn't exist — never two distinct responses.
+
+See [MODULE_GUIDE.md](MODULE_GUIDE.md) for the worked example and [PHILOSOPHY.md](PHILOSOPHY.md) §Law 15 for the principle.
+
+### Federation identity exchange (always-on as of Phase 5)
+
+mod_node runs a **per-connection identity exchange** immediately after the PORTAL02 handshake completes:
+
+1. The initiator sends `CALL /<peer>/node/functions/identity_proof` with its outbound key for that peer in the `key` header.
+2. The responder validates the key against its own local Portal user registry (via `core->auth_find_by_key`). On match, it stores the resolved local user on the peer's struct and returns 200 with **its** outbound key for the same peer in the response body. On miss, it returns 401 with no body — strict initiator-first ordering ensures we don't reveal our key to a stranger.
+3. The initiator validates the body against its local registry, stores the result on the peer's struct.
+
+From this point on, every inbound message from that peer is dispatched with `ctx->auth.user` and `ctx->auth.labels` populated from the locally-resolved user — *not* from anything the wire claimed. If the exchange didn't run or didn't validate, the peer is **anonymous**: downstream ACL denies labeled paths and Law 15 denies labeled rows.
+
+The legacy "promote every inbound federation message to local root via the shared federation_key" compat path was removed in Phase 5 (commit log: 2026-04-19). The shared `federation_key` retains its narrower role: gating who can join the mesh at handshake time. Knowing it grants no user-level privileges.
+
+**Module-API helpers**:
+
+```c
+int (*auth_find_by_key)(portal_core_t *core, const char *api_key,
+                         char *out_username, size_t out_username_sz,
+                         portal_labels_t *out_labels);
+int (*auth_find_user)(portal_core_t *core, const char *username,
+                      portal_labels_t *out_labels);
+```
+
+Both pure read — no session created. `auth_find_by_key` is what mod_node uses for the identity exchange itself. `auth_find_user` is available for any module that needs to look up a user by name. Internals: `portal_auth_find_by_key` and `portal_auth_find_user` in `src/core/core_auth.c`.
+
+**Configuration** (`mod_node.conf`):
+
+```
+peer_default_key = <hex>                     # used for any peer without an override
+peer_keys = <peer1>:<hex>, <peer2>:<hex>     # per-peer key (recommended for multi-tenant)
+```
+
+`peer_default_key` is convenient for simple deployments where all peers share an identity. For a multi-tenant fleet (the SSIP hub case), leave it empty and use only per-peer entries; that way compromise of one peer's key reveals only that peer's identity. Stale configs with the now-removed `federation_strict_identity` / `federation_default_outbound_user` / `federation_default_inbound_user` lines are silently ignored — they can be left in place during a deployment window or removed at any time without behavior change.
+
+**Mutation-endpoint gate (Phase 3).** Core paths under `/users/`, `/groups/`, `/core/modules/` (load/unload CALL), and `/core/config/set` require the caller to be either Portal user `root` OR carry the `hub-admin` label. GET/list endpoints stay open to any authenticated caller. The `/users/<name>/password` CALL additionally allows a user to change their OWN password without `hub-admin`. Denied callers receive `403 FORBIDDEN`. This closes a gap where peers reconciled to non-admin local users (carrier-bots in the SSIP fleet) could still mutate users, groups, modules, or config because these paths are prefix-routed (not registered with labels) and therefore bypassed the Law 8 ACL gate.
+
+**`source_node` is now populated** for federation-sourced messages — handlers that need to know which peer sent them a message can read `msg->ctx->source_node`. It was always declared in `portal_ctx_t` but never set; mod_node now writes the source peer's name into it on every inbound dispatch (regardless of whether strict mode is on).
+
+See [MODULE_GUIDE.md](MODULE_GUIDE.md) §Cross-peer identity and the plan file for the full rollout phases.
+
 ---
 
 ## 7. Internal Core Paths
@@ -479,7 +556,7 @@ These paths are registered by the core at startup. Available to all modules.
 | `/core/modules/<name>` | CALL | `action=load\|unload\|reload` | Module lifecycle |
 | `/core/paths` | GET | — | List all registered paths |
 | `/core/ls` | GET | `prefix=/foo` | List next-level children at prefix |
-| `/core/resolve` | GET | `cwd=/a/b`, `target=../c` | Resolve relative path |
+| `/core/resolve` | GET | `cwd=/a/b`, `target=../c` | Resolve relative path against cwd (handles `/abs`, `..`, empty target, relative). Returns `PORTAL_OK` + absolute path if the resolved path either exactly matches a registered path or is the prefix of one (e.g. `/sysinfo` covers `/sysinfo/resources/os`); returns `PORTAL_NOT_FOUND` otherwise. Used by `cd` to reject non-existent targets with filesystem-like semantics. |
 
 ### Authentication
 

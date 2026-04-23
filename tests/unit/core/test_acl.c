@@ -235,6 +235,200 @@ static void test_acl_remove_label_opens(void)
     printf("OK\n");
 }
 
+/* --- Law 15 — portal_labels_allow tests --- */
+
+static void test_labels_allow_null_ctx(void)
+{
+    printf("test_labels_allow_null_ctx... ");
+    portal_labels_t row = {0};
+    portal_labels_add(&row, "group-5");
+
+    int bypass = -1;
+    /* Null ctx = internal call = allowed, no bypass flag. */
+    assert(portal_labels_allow(NULL, &row, &bypass) == 1);
+    assert(bypass == 0);
+
+    /* Also works when caller doesn't care about bypass flag. */
+    assert(portal_labels_allow(NULL, &row, NULL) == 1);
+
+    printf("OK\n");
+}
+
+static void test_labels_allow_root_bypass(void)
+{
+    printf("test_labels_allow_root_bypass... ");
+    portal_ctx_t ctx = {0};
+    ctx.auth.user = "root";
+
+    portal_labels_t row = {0};
+    portal_labels_add(&row, "group-5");
+
+    int bypass = -1;
+    /* Root sees anything. No bypass flag — root is the built-in, not sys.see_all. */
+    assert(portal_labels_allow(&ctx, &row, &bypass) == 1);
+    assert(bypass == 0);
+
+    printf("OK\n");
+}
+
+static void test_labels_allow_sys_see_all(void)
+{
+    printf("test_labels_allow_sys_see_all... ");
+    portal_ctx_t ctx = {0};
+    ctx.auth.user = "supervisor";
+    portal_labels_add(&ctx.auth.labels, "sys.see_all");
+
+    portal_labels_t row = {0};
+    portal_labels_add(&row, "group-5");
+    portal_labels_add(&row, "group-19");
+
+    int bypass = 0;
+    /* sys.see_all grants access AND flags the bypass so the wrapper can audit. */
+    assert(portal_labels_allow(&ctx, &row, &bypass) == 1);
+    assert(bypass == 1);
+
+    printf("OK\n");
+}
+
+static void test_labels_allow_public_row(void)
+{
+    printf("test_labels_allow_public_row... ");
+    portal_ctx_t ctx = {0};
+    ctx.auth.user = "alice";
+    portal_labels_add(&ctx.auth.labels, "group-5");
+
+    /* Row with no labels = visible to anyone. */
+    portal_labels_t empty = {0};
+    int bypass = -1;
+    assert(portal_labels_allow(&ctx, &empty, &bypass) == 1);
+    assert(bypass == 0);
+
+    /* Null row_labels behaves identically. */
+    assert(portal_labels_allow(&ctx, NULL, &bypass) == 1);
+    assert(bypass == 0);
+
+    printf("OK\n");
+}
+
+static void test_labels_allow_intersect(void)
+{
+    printf("test_labels_allow_intersect... ");
+    portal_ctx_t ctx = {0};
+    ctx.auth.user = "alice";
+    portal_labels_add(&ctx.auth.labels, "group-5");
+    portal_labels_add(&ctx.auth.labels, "region-north");
+
+    /* Row tagged with one of her labels → visible. */
+    portal_labels_t row = {0};
+    portal_labels_add(&row, "group-5");
+    portal_labels_add(&row, "group-9");
+    int bypass = -1;
+    assert(portal_labels_allow(&ctx, &row, &bypass) == 1);
+    assert(bypass == 0);
+
+    printf("OK\n");
+}
+
+static void test_labels_allow_no_intersect(void)
+{
+    printf("test_labels_allow_no_intersect... ");
+    portal_ctx_t ctx = {0};
+    ctx.auth.user = "alice";
+    portal_labels_add(&ctx.auth.labels, "group-5");
+
+    /* Row tagged only with labels she doesn't have → hidden. */
+    portal_labels_t row = {0};
+    portal_labels_add(&row, "group-9");
+    portal_labels_add(&row, "group-19");
+    int bypass = -1;
+    assert(portal_labels_allow(&ctx, &row, &bypass) == 0);
+    assert(bypass == 0);
+
+    printf("OK\n");
+}
+
+static void test_labels_allow_ctx_no_labels(void)
+{
+    printf("test_labels_allow_ctx_no_labels... ");
+    portal_ctx_t ctx = {0};
+    ctx.auth.user = "nobody";
+    /* No labels on the user. */
+
+    /* Against a labeled row → denied. */
+    portal_labels_t row = {0};
+    portal_labels_add(&row, "group-5");
+    assert(portal_labels_allow(&ctx, &row, NULL) == 0);
+
+    /* Against a public row → still allowed. */
+    portal_labels_t empty = {0};
+    assert(portal_labels_allow(&ctx, &empty, NULL) == 1);
+
+    printf("OK\n");
+}
+
+/* --- portal_auth_find_by_key — federation identity reconciler primitive --- */
+
+#include "../src/core/core_auth.h"
+
+static void test_auth_find_by_key_match(void)
+{
+    printf("test_auth_find_by_key_match... ");
+    portal_auth_registry_t auth = {0};
+    auth.user_count = 1;
+    snprintf(auth.users[0].username, sizeof(auth.users[0].username),
+             "dev-root-5");
+    snprintf(auth.users[0].api_key, sizeof(auth.users[0].api_key),
+             "3f2a91c4b87d2e06aaaa1111bbbb2222cccc3333dddd4444eeee5555ffff0000");
+    portal_labels_add(&auth.users[0].labels, "ssip5");
+
+    auth_user_t *found = portal_auth_find_by_key(&auth, auth.users[0].api_key);
+    assert(found == &auth.users[0]);
+    assert(strcmp(found->username, "dev-root-5") == 0);
+    assert(portal_labels_has(&found->labels, "ssip5") == 1);
+
+    printf("OK\n");
+}
+
+static void test_auth_find_by_key_miss(void)
+{
+    printf("test_auth_find_by_key_miss... ");
+    portal_auth_registry_t auth = {0};
+    auth.user_count = 1;
+    snprintf(auth.users[0].api_key, sizeof(auth.users[0].api_key),
+             "aaaa1111bbbb2222cccc3333dddd4444");
+
+    assert(portal_auth_find_by_key(&auth, "nope-not-a-real-key") == NULL);
+
+    printf("OK\n");
+}
+
+static void test_auth_find_by_key_empty_key(void)
+{
+    printf("test_auth_find_by_key_empty_key... ");
+    portal_auth_registry_t auth = {0};
+
+    assert(portal_auth_find_by_key(&auth, NULL) == NULL);
+    assert(portal_auth_find_by_key(&auth, "")   == NULL);
+    assert(portal_auth_find_by_key(NULL, "x")   == NULL);
+
+    printf("OK\n");
+}
+
+static void test_auth_find_by_key_ignores_empty_stored_key(void)
+{
+    printf("test_auth_find_by_key_ignores_empty_stored_key... ");
+    portal_auth_registry_t auth = {0};
+    auth.user_count = 1;
+    snprintf(auth.users[0].username, sizeof(auth.users[0].username),
+             "keyless");
+    auth.users[0].api_key[0] = '\0';
+
+    assert(portal_auth_find_by_key(&auth, "") == NULL);
+    assert(portal_auth_find_by_key(&auth, "some-key") == NULL);
+
+    printf("OK\n");
+}
+
 int main(void)
 {
     printf("=== Portal ACL Tests ===\n\n");
@@ -252,6 +446,21 @@ int main(void)
     test_acl_root_bypasses();
     test_acl_nonexistent_path();
     test_acl_remove_label_opens();
+
+    /* Law 15 — portal_labels_allow */
+    test_labels_allow_null_ctx();
+    test_labels_allow_root_bypass();
+    test_labels_allow_sys_see_all();
+    test_labels_allow_public_row();
+    test_labels_allow_intersect();
+    test_labels_allow_no_intersect();
+    test_labels_allow_ctx_no_labels();
+
+    /* Federation reconciler primitive — portal_auth_find_by_key */
+    test_auth_find_by_key_match();
+    test_auth_find_by_key_miss();
+    test_auth_find_by_key_empty_key();
+    test_auth_find_by_key_ignores_empty_stored_key();
 
     printf("\nAll tests passed.\n");
     return 0;
